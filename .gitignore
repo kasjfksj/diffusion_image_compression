@@ -1,0 +1,5 @@
+./data_1
+./data
+./checkpoints
+./checkpoints/uqdm-small/checkpoint.pt
+./checkpoints/uqdm-tiny/checkpoint.pt
