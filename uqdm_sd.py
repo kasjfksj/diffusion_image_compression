@@ -6,7 +6,7 @@ from torch.distributions import constraints, TransformedDistribution, SigmoidTra
 from torch.distributions import Normal, Uniform
 from torch.distributions.kl import kl_divergence
 from safetensors.torch import load_file
-
+from diffusers import UNet2DConditionModel, DDPMScheduler
 # For compression to bits only
 from tensorflow_compression.python.ops import gen_ops
 import tensorflow as tf
@@ -27,390 +27,49 @@ DATASET_PATH = {
     'ImageNet64': 'data/imagenet64/',
 }
 
-"""
-PyTorch Implementation of 'Progressive Compression with Universally Quantized Diffusion Models', Yang et al., 2025.
-Written with focus on readability for a single GPU.
 
-Sections:
-Model:   Denoising network
-Data:    ImageNet64 data
-UQDM:    Diffusion model + codec + simple trainer for the network + saving / loading
+def softplus_inverse(x):
+    """Helper which computes the inverse of `tf.nn.softplus`."""
+    import math
+    import numpy as np
+    return math.log(np.expm1(x))
+class SD15ScoreNet(torch.nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.mcfg = config.model
+        self.SOFTPLUS_INV1 = softplus_inverse(1.0)
 
-Major changes from previous work are highlighted in the class UQDM
-"""
-
-"""
-Denoising network, Exponential Moving Average (EMA)
-"""
-
-
-class VDM_Net(torch.nn.Module):
-    """
-    Based on score Net from
-    https://github.com/addtt/variational-diffusion-models/blob/main/vdm_unet.py
-    which itself is based on
-    https://github.com/google-research/vdm/blob/main/model_vdm.py
-    and maps parameters via
-
-    vdm_unet         ->        model_vdm
-    mcfg.n_attention_heads:    1 (fixed)
-    mcfg.embedding_dim:        sm_n_embd
-    mcfg.n_blocks:             sm_n_layer
-    mcfg.dropout_prob:         sm_pdrop
-    mcfg.norm_groups:          32 (fixed, default setting for flax.linen.GroupNorm)
-
-    In addition to predicting the noise, we (optionally) predict backward variances by doubling the output channels.
-    """
-
-    @staticmethod
-    def softplus_inverse(x):
-        """Helper which computes the inverse of `tf.nn.softplus`."""
-        import math
-        import numpy as np
-        return math.log(np.expm1(x))
+        self.unet = UNet2DConditionModel.from_pretrained(
+            "runwayml/stable-diffusion-v1-5",
+            subfolder="unet"
+        ).cuda()
+        self.sd_scheduler = DDPMScheduler.from_pretrained(
+            "stable-diffusion-v1-5/stable-diffusion-v1-5",
+            subfolder="scheduler"
+        )
+        # Extra head to predict scale factors, matching VDM_Net's approach
+        self.scale_head = nn.Conv2d(4, 4, kernel_size=1).cuda()
+        nn.init.zeros_(self.scale_head.weight)
+        nn.init.zeros_(self.scale_head.bias)
 
     def softplus_init1(self, x):
-        # Softplus with a shift to bias the output towards 1.0.
         return torch.nn.functional.softplus(x + self.SOFTPLUS_INV1)
 
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.mcfg = mcfg = config.model
-
-        attention_params = dict(
-            n_heads=mcfg.n_attention_heads,
-            n_channels=mcfg.embedding_dim,
-            norm_groups=mcfg.norm_groups,
-        )
-        resnet_params = dict(
-            ch_in=mcfg.embedding_dim,
-            ch_out=mcfg.embedding_dim,
-            condition_dim=4 * mcfg.embedding_dim,
-            dropout_prob=mcfg.dropout_prob,
-            norm_groups=mcfg.norm_groups,
-        )
-        if mcfg.use_fourier_features:
-            self.fourier_features = FourierFeatures()
-        self.embed_conditioning = nn.Sequential(
-            nn.Linear(mcfg.embedding_dim, mcfg.embedding_dim * 4),
-            nn.SiLU(),
-            nn.Linear(mcfg.embedding_dim * 4, mcfg.embedding_dim * 4),
-            nn.SiLU(),
-        )
-        total_input_ch = mcfg.n_channels
-        if mcfg.use_fourier_features:
-            total_input_ch *= 1 + self.fourier_features.num_features
-        self.conv_in = nn.Conv2d(total_input_ch, mcfg.embedding_dim, 3, padding=1)
-
-        # Down path: n_blocks blocks with a resnet block and maybe attention.
-        self.down_blocks = nn.ModuleList(
-            UpDownBlock(
-                resnet_block=ResnetBlock(**resnet_params),
-                attention_block=AttentionBlock(**attention_params)
-                if mcfg.attention_everywhere
-                else None,
-            )
-            for _ in range(mcfg.n_blocks)
-        )
-
-        self.mid_resnet_block_1 = ResnetBlock(**resnet_params)
-        self.mid_attn_block = AttentionBlock(**attention_params)
-        self.mid_resnet_block_2 = ResnetBlock(**resnet_params)
-
-        # Up path: n_blocks+1 blocks with a resnet block and maybe attention.
-        resnet_params["ch_in"] *= 2  # double input channels due to skip connections
-        self.up_blocks = nn.ModuleList(
-            UpDownBlock(
-                resnet_block=ResnetBlock(**resnet_params),
-                attention_block=AttentionBlock(**attention_params)
-                if mcfg.attention_everywhere
-                else None,
-            )
-            for _ in range(mcfg.n_blocks + 1)
-        )
-
-        output_channels = mcfg.n_channels
-        if config.model.get('learned_prior_scale'):
-            output_channels *= 2
-
-        self.conv_out = nn.Sequential(
-            nn.GroupNorm(num_groups=mcfg.norm_groups, num_channels=mcfg.embedding_dim),
-            nn.SiLU(),
-            zero_init(nn.Conv2d(mcfg.embedding_dim, output_channels, kernel_size=3, padding=1)),
-        )
-
-        self.SOFTPLUS_INV1 = self.softplus_inverse(1.0)
-
     def forward(self, z, g_t):
-        # Get gamma to shape (B, ).
-        g_t = g_t.expand(z.shape[0])  # assume shape () or (1,) or (B,)
-        assert g_t.shape == (z.shape[0],)
-        # Rescale to [0, 1], but only approximately since gamma0 & gamma1 are not fixed.
-        t = (g_t - self.mcfg.gamma_min) / (self.mcfg.gamma_max - self.mcfg.gamma_min)
-        t_embedding = get_timestep_embedding(t, self.mcfg.embedding_dim)
-        # We will condition on time embedding.
-        cond = self.embed_conditioning(t_embedding)
+        g_t = g_t.expand(z.shape[0])
 
-        h = self.maybe_concat_fourier(z)
-        h = self.conv_in(h)  # (B, embedding_dim, H, W)
-        hs = []
-        for down_block in self.down_blocks:  # n_blocks times
-            hs.append(h)
-            h = down_block(h, cond)
-        hs.append(h)
-        h = self.mid_resnet_block_1(h, cond)
-        h = self.mid_attn_block(h)
-        h = self.mid_resnet_block_2(h, cond)
-        for up_block in self.up_blocks:  # n_blocks+1 times
-            h = torch.cat([h, hs.pop()], dim=1)
-            h = up_block(h, cond)
-        h = self.conv_out(h)
+        alpha2_target = torch.sigmoid(-g_t)
+        alphas_cumprod = self.sd_scheduler.alphas_cumprod.to(z.device)
+        diffs = (alphas_cumprod.unsqueeze(0) - alpha2_target.unsqueeze(1)).abs()
+        timesteps = diffs.argmin(dim=1).long()
 
-        if self.mcfg.get('learned_prior_scale'):
+        null_cond = torch.zeros(z.shape[0], 77, 768, device=z.device, dtype=z.dtype)
+        with torch.no_grad():
+            eps_hat = self.unet(z, timesteps, encoder_hidden_states=null_cond).sample
 
-            # Split the output into a mean and scale component. (B, C, H, W)
-            eps_hat, pred_scale_factors = torch.split(h, self.mcfg.n_channels, dim=1)
-            pred_scale_factors = self.softplus_init1(pred_scale_factors)  # Make positive.
-        else:
-            eps_hat = h
-
-        assert eps_hat.shape == z.shape, (eps_hat.shape, z.shape)
-        eps_hat = eps_hat + z
-
-        if self.mcfg.get('learned_prior_scale'):
-            return eps_hat, pred_scale_factors
-        else:
-            return eps_hat
-
-    def maybe_concat_fourier(self, z):
-        if self.mcfg.use_fourier_features:
-            return torch.cat([z, self.fourier_features(z)], dim=1)
-        return z
-@torch.no_grad()
-def zero_init(module: nn.Module) -> nn.Module:
-    for p in module.parameters():
-        nn.init.zeros_(p.data)
-    return module
-class VDM_SD_Net(torch.nn.Module):
-    """Now works directly in latent space - no VAE encode/decode needed!"""
-    
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.mcfg = mcfg = config.model
-        
-        from diffusers import UNet2DConditionModel
-        self.unet = UNet2DConditionModel.from_pretrained(
-            "runwayml/stable-diffusion-v1-5", 
-            subfolder="unet"
-        )
-        self.unet.requires_grad_(False)
-        self.unet.eval()
-        
-        # Time embedding adapter
-        self.time_proj = nn.Linear(mcfg.embedding_dim, self.unet.config.cross_attention_dim)
-        
-        # Output: 4 channels (latent) or 8 if learned scale
-        out_ch = 4 * 2 if mcfg.get('learned_prior_scale') else 4
-        self.conv_out = nn.Conv2d(self.unet.config.out_channels, out_ch, 1)
-        
-        if mcfg.get('learned_prior_scale'):
-            self.SOFTPLUS_INV1 = VDM_Net.softplus_inverse(1.0)
-    
-    def forward(self, z_latent, g_t):
-        """
-        z_latent: [B, 4, H/8, W/8] - already in latent space!
-        Returns: eps_hat in latent space [B, 4, H/8, W/8]
-        """
-        g_t = g_t.expand(z_latent.shape[0])
-        t = (g_t - self.mcfg.gamma_min) / (self.mcfg.gamma_max - self.mcfg.gamma_min)
-        t_emb = get_timestep_embedding(t, self.mcfg.embedding_dim)
-        
-        # UNet forward - z_latent is already 4-channel latent
-        encoder_hidden_states = self.time_proj(t_emb).unsqueeze(1)
-        h = self.unet(z_latent, timestep=t * 1000, encoder_hidden_states=encoder_hidden_states).sample
-        h = self.conv_out(h)
-        
-        if self.mcfg.get('learned_prior_scale'):
-            eps_hat, scale = torch.split(h, 4, dim=1)
-            scale = torch.nn.functional.softplus(scale + self.SOFTPLUS_INV1)
-            return eps_hat, scale
-        else:
-            return h
-class ResnetBlock(nn.Module):
-    def __init__(
-            self,
-            ch_in,
-            ch_out=None,
-            condition_dim=None,
-            dropout_prob=0.0,
-            norm_groups=32,
-    ):
-        super().__init__()
-        ch_out = ch_in if ch_out is None else ch_out
-        self.ch_out = ch_out
-        self.condition_dim = condition_dim
-        self.net1 = nn.Sequential(
-            nn.GroupNorm(num_groups=norm_groups, num_channels=ch_in),
-            nn.SiLU(),
-            nn.Conv2d(ch_in, ch_out, kernel_size=3, padding=1),
-        )
-        if condition_dim is not None:
-            self.cond_proj = zero_init(nn.Linear(condition_dim, ch_out, bias=False))
-        self.net2 = nn.Sequential(
-            nn.GroupNorm(num_groups=norm_groups, num_channels=ch_out),
-            nn.SiLU(),
-            *([nn.Dropout(dropout_prob)] * (dropout_prob > 0.0)),
-            zero_init(nn.Conv2d(ch_out, ch_out, kernel_size=3, padding=1)),
-        )
-        if ch_in != ch_out:
-            self.skip_conv = nn.Conv2d(ch_in, ch_out, kernel_size=1)
-
-    def forward(self, x, condition):
-        h = self.net1(x)
-        if condition is not None:
-            assert condition.shape == (x.shape[0], self.condition_dim)
-            condition = self.cond_proj(condition)
-            condition = condition[:, :, None, None]
-            h = h + condition
-        h = self.net2(h)
-        if x.shape[1] != self.ch_out:
-            x = self.skip_conv(x)
-        assert x.shape == h.shape
-        return x + h
-
-
-def get_timestep_embedding(
-        timesteps,
-        embedding_dim: int,
-        dtype=torch.float32,
-        max_timescale=10_000,
-        min_timescale=1,
-):
-    # Adapted from tensor2tensor and VDM codebase.
-    assert timesteps.ndim == 1
-    assert embedding_dim % 2 == 0
-    timesteps *= 1000.0  # In DDPM the time step is in [0, 1000], here [0, 1]
-    num_timescales = embedding_dim // 2
-    inv_timescales = torch.logspace(  # or exp(-linspace(log(min), log(max), n))
-        -np.log10(min_timescale),
-        -np.log10(max_timescale),
-        num_timescales,
-        device=timesteps.device,
-    )
-    emb = timesteps.to(dtype)[:, None] * inv_timescales[None, :]  # (T, D/2)
-    return torch.cat([emb.sin(), emb.cos()], dim=1)  # (T, D)
-
-
-class FourierFeatures(nn.Module):
-    def __init__(self, first=5.0, last=6.0, step=1.0):
-        super().__init__()
-        self.freqs_exponent = torch.arange(first, last + 1e-8, step)
-
-    @property
-    def num_features(self):
-        return len(self.freqs_exponent) * 2
-
-    def forward(self, x):
-        assert len(x.shape) >= 2
-
-        # Compute (2pi * 2^n) for n in freqs.
-        freqs_exponent = self.freqs_exponent.to(dtype=x.dtype, device=x.device)  # (F, )
-        freqs = 2.0 ** freqs_exponent * 2 * torch.pi  # (F, )
-        freqs = freqs.view(-1, *([1] * (x.dim() - 1)))  # (F, 1, 1, ...)
-
-        # Compute (2pi * 2^n * x) for n in freqs.
-        features = freqs * x.unsqueeze(1)  # (B, F, X1, X2, ...)
-        features = features.flatten(1, 2)  # (B, F * C, X1, X2, ...)
-
-        # Output features are cos and sin of above. Shape (B, 2 * F * C, H, W).
-        return torch.cat([features.sin(), features.cos()], dim=1)
-
-
-def attention_inner_heads(qkv, num_heads):
-    """Computes attention with heads inside of qkv in the channel dimension.
-
-    Args:
-        qkv: Tensor of shape (B, 3*H*C, T) with Qs, Ks, and Vs, where:
-            H = number of heads,
-            C = number of channels per head.
-        num_heads: number of heads.
-
-    Returns:
-        Attention output of shape (B, H*C, T).
-    """
-
-    bs, width, length = qkv.shape
-    ch = width // (3 * num_heads)
-
-    # Split into (q, k, v) of shape (B, H*C, T).
-    q, k, v = qkv.chunk(3, dim=1)
-
-    # Rescale q and k. This makes them contiguous in memory.
-    scale = ch ** (-1 / 4)  # scale with 4th root = scaling output by sqrt
-    q = q * scale
-    k = k * scale
-
-    # Reshape qkv to (B*H, C, T).
-    new_shape = (bs * num_heads, ch, length)
-    q = q.view(*new_shape)
-    k = k.view(*new_shape)
-    v = v.reshape(*new_shape)
-
-    # Compute attention.
-    weight = torch.einsum("bct,bcs->bts", q, k)  # (B*H, T, T)
-    weight = torch.softmax(weight.float(), dim=-1).to(weight.dtype)  # (B*H, T, T)
-    out = torch.einsum("bts,bcs->bct", weight, v)  # (B*H, C, T)
-    return out.reshape(bs, num_heads * ch, length)  # (B, H*C, T)
-
-
-class Attention(nn.Module):
-    # Based on https://github.com/openai/guided-diffusion.
-
-    def __init__(self, n_heads):
-        super().__init__()
-        self.n_heads = n_heads
-
-    def forward(self, qkv):
-        assert qkv.dim() >= 3, qkv.dim()
-        assert qkv.shape[1] % (3 * self.n_heads) == 0
-        spatial_dims = qkv.shape[2:]
-        qkv = qkv.view(*qkv.shape[:2], -1)  # (B, 3*H*C, T)
-        out = attention_inner_heads(qkv, self.n_heads)  # (B, H*C, T)
-        return out.view(*out.shape[:2], *spatial_dims)
-
-
-class AttentionBlock(nn.Module):
-    """Self-attention residual block."""
-
-    def __init__(self, n_heads, n_channels, norm_groups):
-        super().__init__()
-        assert n_channels % n_heads == 0
-        self.layers = nn.Sequential(
-            nn.GroupNorm(num_groups=norm_groups, num_channels=n_channels),
-            nn.Conv2d(n_channels, 3 * n_channels, kernel_size=1),  # (B, 3 * C, H, W)
-            Attention(n_heads),
-            zero_init(nn.Conv2d(n_channels, n_channels, kernel_size=1)),
-        )
-
-    def forward(self, x):
-        return self.layers(x) + x
-
-
-class UpDownBlock(nn.Module):
-    def __init__(self, resnet_block, attention_block=None):
-        super().__init__()
-        self.resnet_block = resnet_block
-        self.attention_block = attention_block
-
-    def forward(self, x, cond):
-        x = self.resnet_block(x, cond)
-        if self.attention_block is not None:
-            x = self.attention_block(x)
-        return x
-
-
+        pred_scale_factors = self.softplus_init1(self.scale_head(eps_hat.detach()))
+        return eps_hat, pred_scale_factors
 class ExponentialMovingAverage:
     """
     Maintains (exponential) moving average of a set of parameters.
@@ -957,7 +616,21 @@ class EntropyModel:
         x = torch.from_numpy(x.numpy()).reshape(self.prior_shape).to(device).to(torch.float32) + self.offsets
         return x
 
+def decode_and_save(z_t, eps_hat, alpha_t, sigma_t, vae, vae_scale_factor=0.18215):
+    # Compute clean latent
+    x_latent = (z_t - sigma_t * eps_hat) / alpha_t
 
+    # Decode through VAE
+    with torch.no_grad():
+        x_pixel = vae.decode(x_latent / vae_scale_factor).sample  # [-1, 1]
+
+    # Convert to image
+    x_pixel = (x_pixel.clamp(-1, 1) + 1) / 2  # [0, 1]
+    x_pixel = (x_pixel * 255).byte()
+    x_pixel = x_pixel[0].permute(1, 2, 0).cpu().numpy()  # first in batch
+
+    alpha_str = f"{alpha_t.flatten()[0].item():.3f}"
+    Image.fromarray(x_pixel).save(f"image_{alpha_str}.png")
 class Diffusion_SD(torch.nn.Module):
     """
     Progressive Compression with Gaussian Diffusion in LATENT SPACE.
@@ -966,7 +639,7 @@ class Diffusion_SD(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.gamma = self.get_noise_schedule(config)
+
         self.step = 0
         self.denoised = None
         
@@ -976,12 +649,34 @@ class Diffusion_SD(torch.nn.Module):
             "runwayml/stable-diffusion-v1-5",
             subfolder="vae"
         )
-        from diffusers import DDPMScheduler
+        
 
         self.vae.requires_grad_(False)
         self.vae.eval()
         self.vae_scale_factor = 0.18215
-        self.gamma = self.get_noise_schedule(config)
+        self.sd_scheduler = DDPMScheduler.from_pretrained(
+            "stable-diffusion-v1-5/stable-diffusion-v1-5",
+            subfolder="scheduler"
+        )
+
+        # Keep VDM gamma schedule for diffusion math
+        self.register_buffer('alphas_cumprod', self.sd_scheduler.alphas_cumprod)  # shape (1000,)
+        self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(self.sd_scheduler.alphas_cumprod))
+        self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - self.sd_scheduler.alphas_cumprod))
+
+        # Keep VDM gamma only for timestep indexing
+        self.gamma = self.get_noise_schedule(config)  # VDM schedule
+
+
+
+    def t_to_timestep(self, t):
+        if isinstance(t, torch.Tensor):
+            t_val = t.flatten()[0].item()
+        else:
+            t_val = float(t)
+        return int(t_val * 999) 
+
+    
 
     def sigma2(self, t):
         return torch.sigmoid(self.gamma(t))
@@ -1029,18 +724,24 @@ class Diffusion_SD(torch.nn.Module):
         gamma_t, gamma_s = self.gamma(t), self.gamma(s)
         alpha_t, alpha_s = self.alpha(t), self.alpha(s)
         sigma_t, sigma_s = self.sigma(t), self.sigma(s)
-        expm1_term = - torch.special.expm1(gamma_s - gamma_t)
-
+        expm1_term = (-torch.special.expm1(gamma_s - gamma_t))
+        null_cond = torch.zeros(z_t.shape[0], 77, 768, device=z_t.device, dtype=z_t.dtype)
+        
         if x_latent is None:
             # Predict noise using score network
             if self.config.model.get('learned_prior_scale'):
+
                 eps_hat, pred_scale_factors = self.score_net(z_t, gamma_t)
+
+
             else:
-                eps_hat = self.score_net(z_t, gamma_t)
+                eps_hat = self.score_net(z_t, gamma_t, encoder_hidden_states=null_cond)
             
             # Compute denoised prediction in LATENT space
             if clip_denoised or cache_denoised:
                 x_latent = (z_t - sigma_t * eps_hat) / alpha_t  # Still in latent space
+
+                decode_and_save(z_t, eps_hat, alpha_t, sigma_t, self.vae, self.vae_scale_factor)
 
             if clip_denoised:
                 # Clip in latent space (less aggressive than [-1,1])
@@ -1048,8 +749,9 @@ class Diffusion_SD(torch.nn.Module):
             
             if cache_denoised:
                 self.denoised = x_latent
-
+         
             scale = sigma_s * torch.sqrt(expm1_term)
+
             if self.config.model.get('base_prior_scale', 'forward_kernel') == 'forward_kernel':
                 scale = sigma_t * torch.sqrt(expm1_term)
             if self.config.model.get('learned_prior_scale'):
@@ -1075,6 +777,8 @@ class Diffusion_SD(torch.nn.Module):
         """Now x_latent is in latent space"""
         p_loc, p_scale = self.get_s_t_params(z_t, t, s, cache_denoised=cache_denoised, x_raw_debug=x_raw)
         q_loc, q_scale = self.get_s_t_params(z_t, t, s, x_latent=x_latent, x_raw_debug=x_raw)
+
+
         p_s_t = self.p_s_t(p_loc, p_scale, t, s)
         q_s_t = self.q_s_t(q_loc, q_scale)
         z_s, rate = self.relative_entropy_coding(q_s_t, p_s_t, compress_mode=compress_mode)
@@ -1191,38 +895,40 @@ class Diffusion_SD(torch.nn.Module):
         return loss, metrics
 
 
+
     @torch.no_grad()
     def sample(self, init_z=None, shape=None, times=None, deterministic=False,
-               clip_samples=False, decode_method='argmax', return_hist=False):
-        """Sample in latent space, decode at the end"""
+            clip_samples=False, decode_method='argmax', return_hist=False):
+        
+        from diffusers import DDIMScheduler
+        scheduler = DDIMScheduler.from_pretrained(
+            "stable-diffusion-v1-5/stable-diffusion-v1-5",
+            subfolder="scheduler"
+        )
+        scheduler.set_timesteps(50)
+
         if init_z is None:
             assert shape is not None
-            p_1 = self.p_1()
-            z = p_1.sample(shape)
+            z = torch.randn(shape, device=device)
         else:
             z = init_z
+
         if return_hist:
             samples = [z]
-        if times is None:
-            times = torch.linspace(1.0, 0.0, self.config.model.n_timesteps + 1, device=device)
 
-        for i in range(len(times) - 1):
-            t, s = times[i], times[i + 1]
-            p_loc, p_scale = self.get_s_t_params(z, t, s, clip_denoised=clip_samples, deterministic=deterministic)
-            if deterministic:
-                z = p_loc
-            else:
-                z = self.p_s_t(p_loc, p_scale, t, s).sample()
+        null_cond = torch.zeros(z.shape[0], 77, 768, device=device)
+
+        for t in scheduler.timesteps:
+            noise_pred = self.score_net.unet(z, t, encoder_hidden_states=null_cond).sample
+            z = scheduler.step(noise_pred, t, z).prev_sample
             if return_hist:
                 samples.append(z)
-        
-        # Decode final latent to pixels
+
         x_raw = self.decode_p_x_z_0(z_0_latent=z, method=decode_method)
 
         if return_hist:
             return x_raw, samples + [x_raw]
-        else:
-            return x_raw
+        return x_raw
 
     
 
@@ -1378,9 +1084,8 @@ class Diffusion_SD(torch.nn.Module):
         }, self.self.config.checkpoint_path)
 
     def load(self, path, use_sd=False):
-        self.score_net = VDM_SD_Net(self.config).cuda()
-        self.ema = ExponentialMovingAverage(self.score_net.parameters(), decay=self.config.model.ema_rate)
-            
+        from diffusers import DDPMScheduler, UNet2DConditionModel
+        self.score_net = SD15ScoreNet(self.config)
             # DON'T create optimizer for inference!
             # self.optimizer = torch.optim.Adam(...)  # ← REMOVE THIS
             
@@ -1556,7 +1261,7 @@ if __name__ == '__main__':
     print(image, dir(image))
     compressed = model.compress(image)
     bits = [len(b) * 8 for b in compressed]
-    reconstructions = model.decompress(compressed, image.shape, recon_method='denoise')
+    reconstructions = model.decompress(compressed, image.shape, recon_method='ancestral')
     assert (reconstructions[-1] == image).all()
     print('Reconstructions via: denoise, compression to bits\nbpps:  %s'
           % np.round(np.cumsum(bits) / np.prod(image.shape) * 3, 4))
