@@ -20,9 +20,8 @@ model_sd = load_checkpoint_SD('checkpoints/uqdm-small', use_sd=True)
 train_iter, eval_iter = load_data_from_folder()
 image = next(iter(eval_iter))
 image = resize(image, size=(512,512))
-# import torch.nn.functional as F
-print(image.shape)  # Should be [B, C, 256, 256]
-# Compress/decompress with SD (all stages)
+
+print(image.shape) 
 compressed_sd = model_sd.compress(image)
 recons_sd = model_sd.decompress(compressed_sd, image.shape, recon_method='ancestral')
 bits_sd = [len(b) * 8 for b in compressed_sd]
@@ -32,20 +31,19 @@ def compute_psnr(original, reconstructed):
     original, reconstructed: tensors of shape [B, C, H, W], values in [0, 1]
     Returns mean PSNR in dB across the batch.
     """
-    mse = torch.mean((original - reconstructed) ** 2, dim=[1, 2, 3])  # per image
+    mse = torch.mean((original - reconstructed) ** 2, dim=[1, 2, 3])  
     psnr = 10 * torch.log10(1.0 / mse)
     return psnr.mean().item()
 
-# Compute PSNR for each progressive stage
+
 psnr_sd = []
 for stage in recons_sd:
-    # Normalize both to [0, 1] if they aren't already
     orig_norm = (image - image.min()) / (image.max() - image.min())
     recon_norm = (stage - stage.min()) / (stage.max() - stage.min())
     psnr_sd.append(compute_psnr(orig_norm, recon_norm))
 
 print(f"PSNR per stage (dB): {np.round(psnr_sd, 3)}")
-# After deleting first model
+
 
 # model_no_sd = load_checkpoint('checkpoints/uqdm-small')
 # compressed_no_sd = model_no_sd.compress(image)

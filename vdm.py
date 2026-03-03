@@ -10,7 +10,7 @@ from diffusers import UNet2DConditionModel, DDPMScheduler
 # For compression to bits only
 from tensorflow_compression.python.ops import gen_ops
 import tensorflow as tf
-import matplotlib.pylab as plt
+import matplotlib.pyplot as plt
 from itertools import islice
 from ml_collections import ConfigDict
 import numpy as np
@@ -20,6 +20,8 @@ from pathlib import Path
 from contextlib import contextmanager
 import zipfile
 from tqdm import tqdm
+
+from uqdm_sd import load_checkpoint_SD
 
 device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
 
@@ -45,7 +47,7 @@ class SD15ScoreNet(torch.nn.Module):
             subfolder="unet"
         ).cuda()
         self.sd_scheduler = DDPMScheduler.from_pretrained(
-            "stable-diffusion-v1-5/stable-diffusion-v1-5",
+            "runwayml/stable-diffusion-v1-5",
             subfolder="scheduler"
         )
         # Extra head to predict scale factors, matching VDM_Net's approach
@@ -321,7 +323,7 @@ def load_data(dataspec, cfg):
     return train_iter, eval_iter
 
 
-def load_checkpoint_SD(path, use_sd=False):
+def load_checkpoint_SD_VDM(path, use_sd=False):
     """
     Load model from checkpoint.
 
@@ -332,7 +334,7 @@ def load_checkpoint_SD(path, use_sd=False):
     with open(os.path.join(path, 'config.json'), 'r') as f:
         config = ConfigDict(json.load(f))
 
-    model = UQDM_SD(config).to(device)
+    model = Diffusion_SD(config).to(device)
     cp_path = config.get('restore_ckpt', None)
     if cp_path is not None:
         model.load(os.path.join(path, cp_path), use_sd=use_sd)
@@ -357,29 +359,18 @@ def local_seed(seed, i=0):
 
 
 class LogisticDistribution(TransformedDistribution):
-    """
-    Creates a logistic distribution parameterized by :attr:`loc` and :attr:`scale`
-    that define the affine transform of a standard logistic distribution.
-    Patterned after https://github.com/pytorch/pytorch/blob/main/torch/distributions/logistic_normal.py
-
-    Args:
-        loc (float or Tensor): mean of the base distribution
-        scale (float or Tensor): standard deviation of the base distribution
-
-    """
     arg_constraints = {"loc": constraints.real, "scale": constraints.positive}
 
-    def __init__(self, loc, scale, validate_args=None):
+    def __init__(self, loc, scale, delta=1.0, validate_args=None):
         self.loc = loc
         self.scale = scale
+        self.delta = delta  # quantization step size
         base_dist = Uniform(torch.tensor(0, dtype=loc.dtype, device=loc.device),
                             torch.tensor(1, dtype=loc.dtype, device=loc.device))
         if not base_dist.batch_shape:
             base_dist = base_dist.expand([1])
         transforms = [SigmoidTransform().inv, AffineTransform(loc=loc, scale=scale)]
-        super().__init__(
-            base_dist, transforms, validate_args=validate_args
-        )
+        super().__init__(base_dist, transforms, validate_args=validate_args)
 
     @property
     def mean(self):
@@ -390,13 +381,10 @@ class LogisticDistribution(TransformedDistribution):
         return super().expand(batch_shape, _instance=new)
 
     def cdf(self, x):
-        # Should be numerically more stable than the default.
         return torch.sigmoid((x - self.loc) / self.scale)
 
     @staticmethod
     def log_sigmoid(x):
-        # A numerically more stable implementation of torch.log(torch.sigmoid(x)).
-        # c.f. https://jax.readthedocs.io/en/latest/_autosummary/jax.nn.log_sigmoid.html#jax.nn.log_sigmoid
         return -torch.nn.functional.softplus(-x)
 
     def log_cdf(self, x):
@@ -405,7 +393,46 @@ class LogisticDistribution(TransformedDistribution):
 
     def log_survival_function(self, x):
         standardized = (x - self.loc) / self.scale
-        return self.log_sigmoid(- standardized)
+        return self.log_sigmoid(-standardized)
+
+    def log_prob(self, x):
+        # log p(x) = log CDF(x + delta/2) - log CDF(-(x - delta/2))
+        # i.e. log of the probability mass in the bin [x-delta/2, x+delta/2]
+        # This is more numerically stable than the default TransformedDistribution log_prob
+        upper = (x + self.delta / 2 - self.loc) / self.scale
+        lower = (x - self.delta / 2 - self.loc) / self.scale
+        # log(sigmoid(upper) - sigmoid(lower)) using log-sum-exp trick for stability
+        log_prob = self.log_sigmoid(upper) + torch.log1p(-torch.exp(self.log_sigmoid(lower) - self.log_sigmoid(upper)))
+        return log_prob
+
+    def discretize(self, u):
+        """
+        Build a discrete distribution for entropy coding under dither u ~ U(-0.5, 0.5).
+        Returns a Categorical over integer symbols k, where:
+            P(k) = CDF((k + 0.5 - loc_shifted) * delta) - CDF((k - 0.5 - loc_shifted) * delta)
+        and loc_shifted = (loc + delta * u) / delta accounts for the dither.
+        """
+        # Number of symbols — covers ~6 std devs on each side
+        K = max(512, int(6 * self.scale.max().item() / self.delta) * 2)
+        K = min(K, 1024)  # cap to avoid memory explosion
+
+        # Shift the loc to account for dither
+        loc_shifted = (self.loc + self.delta * u) / self.delta  # in units of delta
+
+        # Integer symbol range centered at 0
+        k_vals = torch.arange(-K // 2, K // 2, device=self.loc.device).float()
+        # Reshape for broadcasting: [1, 1, 1, 1, K]
+        k_vals = k_vals.reshape([1] * self.loc.ndim + [-1])
+
+        # CDF differences to get probability of each symbol
+        upper = (k_vals + 0.5 - loc_shifted.unsqueeze(-1)) * (self.delta / self.scale.unsqueeze(-1))
+        lower = (k_vals - 0.5 - loc_shifted.unsqueeze(-1)) * (self.delta / self.scale.unsqueeze(-1))
+
+        log_probs = self.log_sigmoid(upper) + torch.log1p(
+            -torch.exp(self.log_sigmoid(lower) - self.log_sigmoid(upper)).clamp(max=1 - 1e-6)
+        )
+
+        return torch.distributions.Categorical(logits=log_probs)
 
 
 class NormalDistribution(torch.distributions.Normal):
@@ -687,25 +714,22 @@ class Diffusion_SD(torch.nn.Module):
         # p(z_1) = N(0, 1) - still works in latent space
         return Normal(torch.tensor(0.0).to(device), torch.tensor(1.0).to(device))
 
-    # These remain unchanged
     def p_s_t(self, p_loc, p_scale, t, s):
-
-        if self.config.model.prior_type == 'logistic':
-            base_dist = LogisticDistribution(loc=p_loc, scale=p_scale * np.sqrt(3. / np.pi ** 2))
-        elif self.config.model.prior_type in ('gaussian', 'normal'):
-            base_dist = NormalDistribution(loc=p_loc, scale=p_scale)
-        else:
-            try:
-                base_dist = getattr(torch.distributions, self.config.model.prior_type)
-            except AttributeError:
-                raise ValueError(f"Unknown prior type {self.config.model.prior_type}")
-        return base_dist
+        return NormalDistribution(loc=p_loc, scale=p_scale)
 
     def q_s_t(self, q_loc, q_scale):
         return NormalDistribution(loc=q_loc, scale=q_scale)
 
     def relative_entropy_coding(self, q, p, compress_mode=None):
-        raise NotImplementedError
+        if not torch.is_inference_mode_enabled():
+            z_s = q.sample()
+        else:
+            # Sample from posterior mean (deterministic) or sample
+            z_s = q.sample()
+        # print((p.scale-q.scale).sum())
+        from torch.distributions import kl_divergence
+        rate = kl_divergence(q, p).sum(dim=[1, 2, 3])
+        return z_s, rate
 
     def get_s_t_params(self, z_t, t, s, x_latent=None, clip_denoised=True, cache_denoised=False, deterministic=False, x_raw_debug=None):
         """
@@ -717,44 +741,38 @@ class Diffusion_SD(torch.nn.Module):
         alpha_t, alpha_s = self.alpha(t), self.alpha(s)
         sigma_t, sigma_s = self.sigma(t), self.sigma(s)
         expm1_term = (-torch.special.expm1(gamma_s - gamma_t))
+
         null_cond = torch.zeros(z_t.shape[0], 77, 768, device=z_t.device, dtype=z_t.dtype)
         
+        # === COMPUTE SCALE ONCE (shared for both p and q) ===
+        scale = sigma_s * torch.sqrt(expm1_term)
+        
+        if self.config.model.get('base_prior_scale', 'forward_kernel') == 'forward_kernel':
+            scale = sigma_t * torch.sqrt(expm1_term)
+        
+        pred_scale_factors = None
         if x_latent is None:
             # Predict noise using score network
             if self.config.model.get('learned_prior_scale'):
-
                 eps_hat, pred_scale_factors = self.score_net(z_t, gamma_t)
-
-
             else:
-                eps_hat,pred_scale_factors  = self.score_net(z_t, gamma_t)
+                eps_hat, _ = self.score_net(z_t, gamma_t)
+            
+            # Apply learned scale factors if they exist
+            if self.config.model.get('learned_prior_scale'):
+                scale = scale * pred_scale_factors
             
             # Compute denoised prediction in LATENT space
             if clip_denoised or cache_denoised:
-
-                x_latent = (z_t - sigma_t * eps_hat) / alpha_t  # Still in latent space
-
-                # decode_and_save(z_t, eps_hat, alpha_t, sigma_t, self.vae, self.vae_scale_factor)
-
+                x_latent = (z_t - sigma_t * eps_hat) / alpha_t
+            
             if clip_denoised:
-                # Clip in latent space (less aggressive than [-1,1])
-                x_latent.clamp_(-4.0, 4.0)  # Latents can have larger range
+                x_latent.clamp_(-4.0, 4.0)
             
             if cache_denoised:
                 self.denoised = x_latent
-         
-            scale = sigma_s * torch.sqrt(expm1_term)
-            # print(expm1_term.flatten()[0].item(), t)
-            # print(scale.shape, scale.max(), scale.min())
 
-            if self.config.model.get('base_prior_scale', 'forward_kernel') == 'forward_kernel':
-                scale = sigma_t * torch.sqrt(expm1_term)
-            if self.config.model.get('learned_prior_scale'):
-                scale = scale * pred_scale_factors
-        else:
-            scale = sigma_s * torch.sqrt(expm1_term)
-
-        # Mean computation - same formulas, different space
+        # Mean computation
         if x_latent is not None:
             if deterministic:
                 loc = sigma_s / sigma_t * z_t - (alpha_t * sigma_s / sigma_t - alpha_s) * x_latent
@@ -772,8 +790,11 @@ class Diffusion_SD(torch.nn.Module):
         """Now x_latent is in latent space"""
         p_loc, p_scale = self.get_s_t_params(z_t, t, s, cache_denoised=cache_denoised, x_raw_debug=x_raw)
         q_loc, q_scale = self.get_s_t_params(z_t, t, s, x_latent=x_latent, x_raw_debug=x_raw)
+
+
         p_s_t = self.p_s_t(p_loc, p_scale, t, s)
         q_s_t = self.q_s_t(q_loc, q_scale)
+
         z_s, rate = self.relative_entropy_coding(q_s_t, p_s_t, compress_mode=compress_mode)
 
         return z_s, rate
@@ -832,8 +853,7 @@ class Diffusion_SD(torch.nn.Module):
         
         # Generate eval_indices based on total_steps, including both endpoints
         n_eval_samples = 8  # Customize this number
-        eval_indices = np.linspace(0, total_steps - 1, n_eval_samples, dtype=int)
-        eval_indices_set = set(eval_indices)  # Convert to set for O(1) lookup
+        eval_indices = set(np.linspace(0, total_steps - 1, n_eval_samples, dtype=int))
         
         metrics = []
 
@@ -852,8 +872,7 @@ class Diffusion_SD(torch.nn.Module):
                 )
             loss_diff += rate_s
 
-            # Only store metrics at eval_indices
-            if recon_method is not None and i in eval_indices_set:
+            if recon_method is not None :
                 x_hat_t = self.denoise_z_t(z_t, recon_method, times=ts_t)
                 metrics += [{
                     'prog_bpds': rate_t.cpu() * rescale_pixel_to_bpd,  # per-step, same as original
@@ -888,9 +907,6 @@ class Diffusion_SD(torch.nn.Module):
             metrics = default_collate(metrics)
         else:
             metrics = {}
-
-
- 
 
         bpd_latent = torch.mean(loss_prior) * rescale_latent_to_bpd
         bpd_diff   = torch.mean(loss_diff)  * rescale_latent_to_bpd
@@ -1110,12 +1126,6 @@ class Diffusion_SD(torch.nn.Module):
     def load(self, path, use_sd=False):
         from diffusers import DDPMScheduler, UNet2DConditionModel
         self.score_net = SD15ScoreNet(self.config)
-            # DON'T create optimizer for inference!
-            # self.optimizer = torch.optim.Adam(...)  # ← REMOVE THIS
-            
-            # If you have SD checkpoint to load:
-            # cp = torch.load(path, map_location=device, weights_only=False)
-            # self.score_net.load_state_dict(cp['model'], strict=False)
 
 
     def trainer(self, train_iter, eval_iter=None):
@@ -1183,13 +1193,12 @@ class Diffusion_SD(torch.nn.Module):
         """
 
         res = []
-        for X in tqdm(islice(eval_iter, n_batches), total=n_batches or len(eval_iter), desc='Evaluating UQDM_SD'):
+        for X in tqdm(islice(eval_iter, n_batches), total=n_batches or len(eval_iter), desc='Evaluating VDM'):
             print('Evaluating batch %s...' % len(res))
             X = X.to(device)
             ths_res = {}
-            
             recon_method = 'denoise'
-                
+
             # If evaluating bpds as file sizes:
             # self.compress_bits = []
             # loss, metrics = self(X, recon_method=recon_method, seed=seed, compress_mode='encode')
@@ -1198,14 +1207,12 @@ class Diffusion_SD(torch.nn.Module):
             loss, metrics = self(X, recon_method=recon_method, seed=seed)
             # print(2)
             bpds = np.cumsum(metrics['prog_bpds'].mean(dim=1))
-            print("test",(metrics['prog_bpds'] < 0).sum().item())
-            print(metrics['prog_bpds'][:10])  # first 10 steps
-            print(metrics['prog_bpds'][-10:])
             # print(3)
             psnrs = self.mse_to_psnr(metrics['prog_mses'].mean(dim=1), max_val=255.)
             # print(4)
             ths_res[recon_method] = dict(bpds=bpds, psnrs=psnrs)
             # print(5)
+            
             res += [ths_res]
         res = default_collate(res)
 
@@ -1213,67 +1220,8 @@ class Diffusion_SD(torch.nn.Module):
             bpps = np.round(3 * res[recon_method]['bpds'].mean(axis=0).numpy(), 4)
             psnrs = np.round(res[recon_method]['psnrs'].mean(axis=0).numpy(), 4)
             print('Reconstructions via: %s\nbpps:  %s\npsnrs: %s\n' % (recon_method, bpps, psnrs))
+
         return bpps, psnrs
-
-class UQDM_SD(Diffusion_SD):
-    """
-    Making Progressive Compression tractable with Universal Quantization.
-    """
-
-    def __init__(self, config):
-        """
-        See Diffusion.__init__ for hyperparameters.
-        """
-        super().__init__(config)
-        self.compress_bits = None
-
-    def p_s_t(self, p_loc, p_scale, t, s):
-        # p(z_s | z_t) is a convolution of g_t and U(+- d_t), d_t = sqrt(12) * sigma_s * sqrt(exmp1term)
-        delta_t = self.sigma(s) * torch.sqrt(- 12 * torch.special.expm1(self.gamma(s) - self.gamma(t)))
-        base_dist = super().p_s_t(p_loc, p_scale, t, s)
-        return UniformNoisyDistribution(base_dist, delta_t)
-
-    def q_s_t(self, q_loc, q_scale):
-        # q(z_s | z_t, x) = U(q_loc +- sqrt(3) * q_scale)
-        return Uniform(low=q_loc - np.sqrt(3) * q_scale, high=q_loc + np.sqrt(3) * q_scale)
-
-    def relative_entropy_coding(self, q, p, compress_mode=None):
-        # Transmit sample z_s ~ q(z_s | z_t, x)
-        if not torch.is_inference_mode_enabled():
-            z_s = q.sample()
-        else:
-            # Apply universal quantization
-            # shared U(-0.5, 0.5), seeds have already been set in self.forward
-            u = torch.rand(q.mean.shape, device=q.mean.device) - 0.5
-
-            # very slow, ~ 25 symbols/s
-            # cp = tfc.NoisyLogistic(loc=0.0, scale=(p.base_dist.scale / p.delta).cpu().numpy())
-            # em2 = tfc.UniversalBatchedEntropyModel(cp, coding_rank=4, compression=True, num_noise_levels=30)
-            # k = (q.mean - p.mean) / p.delta
-            # bitstring = em2.compress(k.cpu())
-            # k_hat = em2.decompress(bitstring, [])
-
-            if compress_mode in ['encode', 'decode']:
-                p_discrete = p.discretize(u)
-            if compress_mode == 'decode':
-                # consume bits
-                quantized = self.entropy_decode(self.compress_bits.pop(0), p_discrete)
-            else:
-                # Add dither U(-delta/2, delta/2)
-                # Transmit residual q - p for greater numerical stability
-                quantized = torch.round((q.mean - p.mean + p.delta * u) / p.delta)
-                if compress_mode == 'encode':
-                    # accumulate bits
-                    self.compress_bits += [self.entropy_encode(quantized, p_discrete)]
-            # Subtract the same (pseudo-random) dither using shared randomness
-            z_s = quantized * p.delta + p.mean - p.delta * u
-
-        # Evaluate z_s under log (posterior/prior) to get MC estimate of KL.
-        rate = - p.log_prob(z_s) - torch.log(p.delta)
-        rate = torch.sum(rate, dim=[1, 2, 3])
-
-        return z_s, rate
-
 
 if __name__ == '__main__':
     import os
@@ -1283,23 +1231,24 @@ if __name__ == '__main__':
     torch.manual_seed(seed)
     torch.use_deterministic_algorithms(True)
 
-    model = load_checkpoint_SD('checkpoints/uqdm-small')
+    model = load_checkpoint_SD_VDM('checkpoints/uqdm-small')
     train_iter, eval_iter = load_data_from_folder()
 
     bpps, psnrs = model.evaluate(eval_iter, n_batches=10, seed=seed)
     bpps = np.array(bpps)
     psnrs = np.array(psnrs)
 
-
+    from scipy.ndimage import uniform_filter1d
 
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(bpps, psnrs, '-', label='UQDM_ImageNet', linewidth=2, color='orange')
+    ax.plot(bpps, psnrs, '-', label='SD', linewidth=2, color='orange')
     ax.set_xlabel('Rate (BPP)', fontsize=13)
     ax.set_ylabel('PSNR (dB)', fontsize=13)
-    ax.set_title('UQDM: Rate-Distortion Curve', fontsize=14)
+    ax.set_title('SD 512*512: Rate-Distortion Curve', fontsize=14)
     ax.legend(fontsize=12, loc='lower right')
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig('uqdm_sd_rd_curve_512.png', dpi=150, bbox_inches='tight')
-    print("Saved plot to uqdm_sd_rd_curve.png")
+    plt.savefig('sd_rd_curve_512.png', dpi=150, bbox_inches='tight')
+    print("Saved plot to sd_rd_curve_512.png")
+

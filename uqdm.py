@@ -8,7 +8,7 @@ from torch.distributions.kl import kl_divergence
 # For compression to bits only
 from tensorflow_compression.python.ops import gen_ops
 import tensorflow as tf
-
+import matplotlib.pylab as plt
 from itertools import islice
 from ml_collections import ConfigDict
 import numpy as np
@@ -495,12 +495,12 @@ class NPZLoader(Dataset):
         self.batch_lens = [self.npz_len(f) for f in self.files]
         self.anchors = np.cumsum([0] + self.batch_lens)
         self.removed_idxs = [[] for _ in range(len(self.files))]
-        # if not train and remove_duplicates:
-        #     removed = np.load(os.path.join(path, 'removed.npz'))
-        #     self.removed_idxs = [
-        #         removed[(removed >= self.anchors[i]) & (removed < self.anchors[i + 1])] - self.anchors[i] for i in
-        #         range(len(self.files))]
-        #     self.anchors -= np.cumsum([0] + [np.size(r) for r in self.removed_idxs])
+        if not train and remove_duplicates:
+            removed = np.load(os.path.join(path, 'removed.npy'))
+            self.removed_idxs = [
+                removed[(removed >= self.anchors[i]) & (removed < self.anchors[i + 1])] - self.anchors[i] for i in
+                range(len(self.files))]
+            self.anchors -= np.cumsum([0] + [np.size(r) for r in self.removed_idxs])
         self.transform = transform
         self.cache_fid = None
         self.cache_npy = None
@@ -1117,7 +1117,13 @@ class Diffusion(torch.nn.Module):
         loss_diff = 0.
         times = torch.linspace(1, 0, self.config.model.n_timesteps + 1, device=device)
         assert len(times) >= 2, "Need at least one diffusion step."
+        total_steps = self.config.model.n_timesteps
         metrics = []
+        eval_indices = set(
+            torch.linspace(0, total_steps - 1, 11)
+            .long().tolist()
+        )
+
         for i in range(len(times) - 1):
             z_t = z_s
             rate_t = rate_s
@@ -1127,14 +1133,13 @@ class Diffusion(torch.nn.Module):
                                                   cache_denoised=recon_method == 'denoise')
             loss_diff += rate_s
 
-            if recon_method is not None:
+            if recon_method is not None and i in eval_indices:  # ← only at sparse points
                 x_hat_t = self.denoise_z_t(z_t, recon_method, times=times[i:])
                 metrics += [{
                     'prog_bpds': rate_t.cpu() * rescale_to_bpd,
                     'prog_x_hats': x_hat_t.detach().cpu(),
                     'prog_mses': torch.mean((x_hat_t - x_raw).float() ** 2, dim=[1, 2, 3]).cpu(),
                 }]
-
         z_0 = z_s
         if recon_method is not None:
             if recon_method == 'ancestral':
@@ -1565,14 +1570,26 @@ if __name__ == '__main__':
     torch.manual_seed(seed)
     torch.use_deterministic_algorithms(True)
 
-    # model = load_checkpoint('checkpoints/uqdm-tiny')
-    # model = load_checkpoint('checkpoints/uqdm-small')
     model = load_checkpoint('checkpoints/uqdm-medium')
-    # model = load_checkpoint('checkpoints/uqdm-big')
     train_iter, eval_iter = load_data('ImageNet64', model.config.data)
 
-    # model.trainer(train_iter, eval_iter)
-    model.evaluate(eval_iter, n_batches=10, seed=seed)
+    bpps, psnrs = model.evaluate(eval_iter, n_batches=10, seed=seed)
+    bpps = np.array(bpps)
+    psnrs = np.array(psnrs)
+
+    from scipy.ndimage import uniform_filter1d
+    psnrs_smooth = uniform_filter1d(psnrs, size=20)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(bpps, psnrs_smooth, '-', label='UQDM (medium)', linewidth=2, color='orange')
+    ax.set_xlabel('Rate (BPP)', fontsize=13)
+    ax.set_ylabel('PSNR (dB)', fontsize=13)
+    ax.set_title('UQDM: Rate-Distortion Curve', fontsize=14)
+    ax.legend(fontsize=12, loc='lower right')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('uqdm_rd_curve.png', dpi=150, bbox_inches='tight')
+    print("Saved plot to uqdm_rd_curve.png")
 
     # Compress one image
     image = next(iter(eval_iter))
