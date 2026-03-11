@@ -1222,7 +1222,305 @@ class Diffusion_SD(torch.nn.Module):
             print('Reconstructions via: %s\nbpps:  %s\npsnrs: %s\n' % (recon_method, bpps, psnrs))
 
         return bpps, psnrs
+    @torch.no_grad()
+    def compute_bpp_matrix(self, x_raw, seed=None, timestep_stride=100, 
+                        num_samples=1, use_kl=True):
+        """
+        Build a BPP (bits-per-pixel) matrix where entry [i, j] = compression cost 
+        of transmitting from timestep ts[i] → ts[j], where ts[i] > ts[j].
+        
+        Efficient implementation: caches z_t, eps_hat, and pred_scale_factors to avoid
+        redundant score_net calls.
+        
+        Args:
+            x_raw:           [B, 3, H, W] input image (pixel values 0-255)
+            seed:            random seed for reproducibility  
+            timestep_stride: step between timesteps (100 = use every 10th SD step)
+            num_samples:     number of samples to average over for BPP estimation
+            use_kl:          if True, use KL divergence; else use relative_entropy_coding
+        
+        Returns:
+            bpp_matrix: [T, T] upper-triangular matrix (numpy), entry [i,j] = bpp from ts[i]→ts[j]
+            timesteps: list of SD integer timesteps corresponding to matrix indices
+        """
+        # --- Setup ---
+        x_pixel = 2 * ((x_raw.float() + .5) / self.config.model.vocab_size) - 1
+        x_latent = self.vae.encode(x_pixel).latent_dist.sample() * self.vae_scale_factor
+        x_latent = x_latent.detach()
+        rescale_pixel_to_bpd = 1. / (np.prod(x_raw.shape[1:]) * np.log(2.))
 
+        # Select timesteps
+        all_ts = self.sd_scheduler.timesteps
+        timesteps = all_ts[::timestep_stride].tolist()
+        if all_ts[-1].item() not in timesteps:
+            timesteps.append(all_ts[-1].item())
+        T = len(timesteps)
+
+        total_transitions = T * (T - 1) // 2
+        print(f"Computing BPP matrix for {T} timesteps (stride={timestep_stride})...")
+        print(f"Total transitions to evaluate: {total_transitions}")
+        print(f"Using {'KL divergence' if use_kl else 'relative entropy coding'} for rate estimation")
+
+        # --- Step 1: Cache z_t, eps_hat, and pred_scale_factors ---
+        print(f"\nStep 1/2: Caching z_t and score predictions for {T} timesteps...")
+        z_cache = {}           # ts_val -> z_t
+        eps_cache = {}         # ts_val -> eps_hat
+        scale_cache = {}       # ts_val -> pred_scale_factors
+
+        for idx, ts_val in enumerate(timesteps):
+            ts_tensor = torch.tensor(ts_val, device=x_latent.device)
+            
+            # Sample z_t ~ q(z_t | x)
+            q_t = self.q_t(x_latent, t=ts_tensor)
+            with local_seed(seed, i=ts_val):
+                z_t = q_t.sample().detach()
+            z_cache[ts_val] = z_t
+            
+            # Get score prediction at this timestep
+            gamma_t = self.gamma(ts_tensor)
+            if self.config.model.get('learned_prior_scale'):
+                eps_hat, pred_scale_factors = self.score_net(z_t, gamma_t)
+                scale_cache[ts_val] = pred_scale_factors.detach()
+            else:
+                eps_hat = self.score_net(z_t, gamma_t)[0]
+                scale_cache[ts_val] = None
+            eps_cache[ts_val] = eps_hat.detach()
+            
+            if (idx + 1) % max(1, T // 10) == 0 or (idx + 1) == T:
+                print(f"  Cached {idx + 1}/{T} timesteps")
+
+        # --- Step 2: Fill the BPP matrix using cached predictions ---
+        print(f"\nStep 2/2: Computing BPP for {total_transitions} transitions...")
+        bpp_matrix = np.zeros((T, T))
+        
+        import time
+        computed = 0
+        start_time = time.time()
+        last_print_time = start_time
+        
+        for i, ts_t in enumerate(timesteps):
+            z_t = z_cache[ts_t]
+            eps_t = eps_cache[ts_t]
+            scale_t = scale_cache[ts_t]
+            ts_t_tensor = torch.tensor(ts_t, device=x_latent.device)
+
+            for j in range(i + 1, T):
+                ts_s = timesteps[j]
+                ts_s_tensor = torch.tensor(ts_s, device=x_latent.device)
+
+                # Compute rate using cached predictions
+                rate_bpp = self._compute_kl_rate(
+                    z_t, ts_t_tensor, ts_s_tensor, x_latent, rescale_pixel_to_bpd,
+                    eps_t, scale_t, use_kl, num_samples, seed, (ts_t, ts_s)
+                )
+
+                bpp_matrix[i, j] = rate_bpp
+                
+                computed += 1
+                current_time = time.time()
+                
+                # Print progress
+                progress_pct = 100 * computed / total_transitions
+                should_print = (
+                    computed % max(1, total_transitions // 20) == 0 or 
+                    computed == total_transitions or
+                    (current_time - last_print_time) >= 2.0
+                )
+                
+                if should_print:
+                    elapsed = current_time - start_time
+                    rate = computed / elapsed if elapsed > 0 else 0
+                    remaining = (total_transitions - computed) / rate if rate > 0 else 0
+                    
+                    print(f"  Progress: {computed}/{total_transitions} ({progress_pct:.1f}%) | "
+                        f"Elapsed: {elapsed:.1f}s | ETA: {remaining:.1f}s | "
+                        f"Rate: {rate:.1f} transitions/s | Current: t={ts_t}→s={ts_s}, BPP={rate_bpp:.4f}")
+                    last_print_time = current_time
+        row_path = sum(bpp_matrix[i, i+1] for i in range(T-1))  # consecutive steps
+        skip_path = bpp_matrix[0, -1]  # direct skip
+        print(f"Sum of consecutive steps: {row_path:.4f}")
+        print(f"Direct 999->0 skip: {skip_path:.4f}")
+        print(f"\nBPP matrix computation complete!")
+        print(self.gamma(torch.tensor(0)))    # should be very negative (high SNR)
+        print(self.gamma(torch.tensor(999)))
+        print(f"Summary Statistics:")
+        print(f"  Total time: {time.time() - start_time:.2f}s")
+        print(f"  Average rate: {total_transitions / (time.time() - start_time):.2f} transitions/s")
+        print(f"  Matrix shape: {bpp_matrix.shape}")
+        print(f"  BPP range: [{np.min(bpp_matrix[bpp_matrix > 0]):.4f}, {np.max(bpp_matrix):.4f}]")
+        print(f"  Mean BPP (non-zero): {np.mean(bpp_matrix[bpp_matrix > 0]):.4f}")
+        return bpp_matrix, timesteps
+
+
+    def _compute_kl_rate(self, z_t, t, s, x_latent, rescale_pixel_to_bpd, 
+                        eps_t, scale_t, use_kl=True, num_samples=1, seed=None, ts_pair=None):
+        """
+        Compute rate using cached epsilon and scale predictions.
+        
+        Args:
+            z_t: Current noisy latent
+            t: Current timestep
+            s: Target timestep (s < t)
+            x_latent: Clean latent (for posterior)
+            rescale_pixel_to_bpd: Rescaling factor to convert to bits-per-pixel
+            eps_t: Cached epsilon prediction from score_net
+            scale_t: Cached scale factors from score_net (or None)
+            use_kl: If True, use KL divergence; else use relative_entropy_coding
+            num_samples: Number of samples for entropy coding
+            seed: Random seed
+            ts_pair: Tuple of (t, s) for seeding
+        
+        Returns:
+            rate_bpp: Rate in bits per pixel
+        """
+        # Get q and p parameters using cached predictions
+        q_loc, q_scale = self._get_s_t_params_from_cache(
+            z_t, t, s, x_latent, eps_t, scale_t, for_posterior=True
+        )
+        p_loc, p_scale = self._get_s_t_params_from_cache(
+            z_t, t, s, x_latent, eps_t, scale_t, for_posterior=False
+        )
+        
+        if use_kl:
+            # KL divergence
+            kl = self._gaussian_kl(q_loc, q_scale, p_loc, p_scale)
+            rate_bpp = kl.sum(dim=[1, 2, 3]).mean().item() * rescale_pixel_to_bpd
+        else:
+            # Relative entropy coding (average over samples)
+            q = self.q_s_t(q_loc, q_scale)
+            p = self.p_s_t(p_loc, p_scale, t, s)
+            
+            rate_samples = []
+            for sample_idx in range(num_samples):
+                with local_seed(seed, i=hash((*ts_pair, sample_idx))):
+                    _, rate = self.relative_entropy_coding(q, p)
+                    rate_bpp = rate.mean().item() * rescale_pixel_to_bpd
+                    rate_samples.append(rate_bpp)
+            rate_bpp = np.mean(rate_samples)
+        
+        return rate_bpp
+
+
+    def _get_s_t_params_from_cache(self, z_t, t, s, x_latent, eps_t, scale_t, for_posterior=True):
+        """
+        Compute (loc, scale) for q(z_s|z_t,x) or p(z_s|z_t) using cached predictions.
+        
+        This replicates the logic from get_s_t_params but uses cached eps_t and scale_t
+        instead of calling score_net again.
+        
+        Args:
+            z_t: Current noisy latent
+            t: Current timestep
+            s: Target timestep
+            x_latent: Clean latent (always provided, used conditionally)
+            eps_t: Cached epsilon prediction
+            scale_t: Cached scale factors (or None)
+            for_posterior: If True, compute q(z_s|z_t,x); else compute p(z_s|z_t)
+        
+        Returns:
+            loc, scale: Distribution parameters
+        """
+        gamma_t, gamma_s = self.gamma(t), self.gamma(s)
+        alpha_t, alpha_s = self.alpha(t), self.alpha(s)
+        sigma_t, sigma_s = self.sigma(t), self.sigma(s)
+        expm1_term = (-torch.special.expm1(gamma_s - gamma_t))
+        
+        # Compute scale (same logic as get_s_t_params)
+        scale = sigma_s * torch.sqrt(expm1_term)
+        if self.config.model.get('base_prior_scale', 'forward_kernel') == 'forward_kernel':
+            scale = sigma_t * torch.sqrt(expm1_term)
+        
+        if for_posterior:
+            # q(z_s | z_t, x) - use true x_latent
+            loc = alpha_s * ((1 - expm1_term) / alpha_t * z_t + expm1_term * x_latent)
+        else:
+            # p(z_s | z_t) - use cached prediction
+            # Apply learned scale if available
+            if self.config.model.get('learned_prior_scale') and scale_t is not None:
+                scale = scale * scale_t
+            
+            # Compute loc using cached epsilon
+            loc = alpha_s / alpha_t * (z_t - sigma_t * expm1_term * eps_t)
+        
+        return loc, scale
+
+
+    @staticmethod
+    def _gaussian_kl(q_loc, q_scale, p_loc, p_scale):
+        """
+        KL( N(q_loc, q_scale^2) || N(p_loc, p_scale^2) ) elementwise.
+        Returns tensor same shape as inputs.
+        
+        Args:
+            q_loc: Posterior mean
+            q_scale: Posterior scale
+            p_loc: Prior mean
+            p_scale: Prior scale
+        
+        Returns:
+            kl: KL divergence (same shape as inputs)
+        """
+        return (
+            torch.log(p_scale / q_scale.clamp(1e-8))
+            + (q_scale**2 + (q_loc - p_loc)**2) / (2 * p_scale**2 + 1e-8)
+            - 0.5
+        )
+
+
+
+@staticmethod
+def compute_average_bpp_matrix(bpp_matrices):
+    """
+    Average multiple BPP matrices from different images.
+    
+    Args:
+        bpp_matrices: list of [T, T] numpy arrays
+    
+    Returns:
+        avg_bpp_matrix: [T, T] numpy array with averaged values
+    
+    Example:
+        >>> matrices = [model.compute_bpp_matrix(img)[0] for img in images]
+        >>> avg_matrix = model.compute_average_bpp_matrix(matrices)
+    """
+    return np.mean(bpp_matrices, axis=0)
+
+
+def find_optimal_path_dp(bpp_matrix, timesteps):
+    import time
+    T = len(bpp_matrix)
+    INF = float('inf')
+    dp = [(INF, -1)] * T
+    dp[0] = (0.0, -1)
+
+    start_time = time.time()
+    for j in range(1, T):
+        for i in range(j):
+            if bpp_matrix[i, j] > 0:
+                cost = dp[i][0] + bpp_matrix[i, j]
+                if cost < dp[j][0]:
+                    dp[j] = (cost, i)
+
+    optimal_cost = dp[T-1][0]
+    optimal_path = []
+    current = T - 1
+    while current != -1:
+        optimal_path.append(current)
+        current = dp[current][1]
+    optimal_path.reverse()
+
+    total_path_cost = sum(bpp_matrix[i, i+1] for i in range(T - 1))
+    timestep_path = [timesteps[i] for i in optimal_path]
+    per_transition_bpp = [bpp_matrix[optimal_path[k], optimal_path[k+1]] for k in range(len(optimal_path) - 1)]
+
+    bpp_breakdown = {
+
+        'total_path_cost': total_path_cost,
+        'optimal_cost': optimal_cost,
+    }
+
+    print(f"DP done in {time.time() - start_time:.3f}s | Optimal: {optimal_cost:.4f} BPP | Total path: {total_path_cost:.4f} BPP")
+    return optimal_path, optimal_cost, timestep_path, bpp_breakdown
 if __name__ == '__main__':
     import os
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
@@ -1238,7 +1536,17 @@ if __name__ == '__main__':
     bpps = np.array(bpps)
     psnrs = np.array(psnrs)
 
-    from scipy.ndimage import uniform_filter1d
+    # --- KL matrix on a single batch ---
+    sample_batch = next(iter(eval_iter)).to(device)   # grab one batch
+
+    bpp_matrix, timesteps = model.compute_bpp_matrix(
+        sample_batch,
+        seed=seed,
+        timestep_stride=1   # gives ~10 timesteps: [999, 899, ..., 99, 0]
+    )
+    print(123)
+    optimal_path, total_bpp, path_timesteps, breakdown = find_optimal_path_dp(bpp_matrix, timesteps)
+    print(optimal_path, path_timesteps,breakdown)
 
 
     fig, ax = plt.subplots(figsize=(10, 6))

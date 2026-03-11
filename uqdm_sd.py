@@ -257,8 +257,8 @@ def load_data_from_folder():
         def __init__(self, folder_path, transform=None):
             self.folder_path = Path(folder_path)
             self.transform = transforms.Compose([
-                transforms.Resize(512),
-                transforms.CenterCrop(512),
+                transforms.Resize(64),
+                transforms.CenterCrop(64),
                 transforms.ToTensor(),
                 transforms.Lambda(lambda x: (x * 255).byte()),  # convert to [0, 255] uint8
             ])
@@ -832,8 +832,8 @@ class Diffusion_SD(torch.nn.Module):
         
         # Generate eval_indices based on total_steps, including both endpoints
         n_eval_samples = 8  # Customize this number
-        eval_indices = np.linspace(0, total_steps - 1, n_eval_samples, dtype=int)
-        eval_indices_set = set(eval_indices)  # Convert to set for O(1) lookup
+        # eval_indices = np.linspace(0, total_steps - 1, n_eval_samples, dtype=int)
+        # eval_indices_set = set(eval_indices)  # Convert to set for O(1) lookup
         
         metrics = []
 
@@ -853,7 +853,7 @@ class Diffusion_SD(torch.nn.Module):
             loss_diff += rate_s
 
             # Only store metrics at eval_indices
-            if recon_method is not None and i in eval_indices_set:
+            if recon_method is not None :
                 x_hat_t = self.denoise_z_t(z_t, recon_method, times=ts_t)
                 metrics += [{
                     'prog_bpds': rate_t.cpu() * rescale_pixel_to_bpd,  # per-step, same as original
@@ -1198,9 +1198,7 @@ class Diffusion_SD(torch.nn.Module):
             loss, metrics = self(X, recon_method=recon_method, seed=seed)
             # print(2)
             bpds = np.cumsum(metrics['prog_bpds'].mean(dim=1))
-            print("test",(metrics['prog_bpds'] < 0).sum().item())
-            print(metrics['prog_bpds'][:10])  # first 10 steps
-            print(metrics['prog_bpds'][-10:])
+
             # print(3)
             psnrs = self.mse_to_psnr(metrics['prog_mses'].mean(dim=1), max_val=255.)
             # print(4)
@@ -1214,6 +1212,7 @@ class Diffusion_SD(torch.nn.Module):
             psnrs = np.round(res[recon_method]['psnrs'].mean(axis=0).numpy(), 4)
             print('Reconstructions via: %s\nbpps:  %s\npsnrs: %s\n' % (recon_method, bpps, psnrs))
         return bpps, psnrs
+
 
 class UQDM_SD(Diffusion_SD):
     """
@@ -1274,7 +1273,391 @@ class UQDM_SD(Diffusion_SD):
 
         return z_s, rate
 
+    @torch.no_grad()
+    def compute_bpp_matrix(self, x_raw, seed=None, timestep_stride=100, num_samples=1):
+        """
+        Build a BPP (bits-per-pixel) matrix where entry [i, j] = compression cost 
+        of transmitting from timestep ts[i] → ts[j], where ts[i] > ts[j].
+        
+        Uses UQDM's relative_entropy_coding approach with uniform quantization
+        and UniformNoisyDistribution to compute compression rates.
+        
+        Strategy:
+        - Cache z_t for all timesteps (T values)
+        - Cache score predictions (eps_hat, pred_scale_factors) for each timestep (T values)
+        - For each (t→s) transition, compute (loc, scale) on-the-fly from cached predictions
+        - Evaluate rate using UQDM's rate computation (with dithering)
+        
+        Args:
+            x_raw:           [B, 3, H, W] input image
+            seed:            random seed for reproducibility  
+            timestep_stride: step between timesteps (100 = use every 10th SD step)
+            num_samples:     number of samples to average over for BPP estimation
+        
+        Returns:
+            bpp_matrix: [T, T] upper-triangular matrix (numpy), entry [i,j] = bpp from ts[i]→ts[j]
+            timesteps: list of SD integer timesteps corresponding to matrix indices
+        """
+        # --- Setup ---
+        x_pixel = 2 * ((x_raw.float() + .5) / self.config.model.vocab_size) - 1
+        x_latent = self.vae.encode(x_pixel).latent_dist.sample() * self.vae_scale_factor
+        x_latent = x_latent.detach()
+        rescale_pixel_to_bpd = 1. / (np.prod(x_raw.shape[1:]) * np.log(2.))
 
+        # Select a subset of SD timesteps for tractable matrix size
+        all_ts = self.sd_scheduler.timesteps  # [999, 998, ..., 0]
+        timesteps = all_ts[::timestep_stride].tolist()  # coarse grid
+        # Always include t=0 equivalent (last timestep)
+        if all_ts[-1].item() not in timesteps:
+            timesteps.append(all_ts[-1].item())
+        T = len(timesteps)
+
+        total_transitions = T * (T - 1) // 2
+        print(f"Computing BPP matrix for {T} timesteps (stride={timestep_stride})...")
+        print(f"Total transitions to evaluate: {total_transitions}")
+
+        # --- Step 1: Cache z_t and score predictions for each timestep ---
+        # We cache: z_t, eps_hat, pred_scale_factors (only T values, not T^2)
+        print(f"\nStep 1/2: Caching z_t and score predictions for {T} timesteps...")
+        z_cache = {}           # ts_val -> z_t
+        eps_cache = {}         # ts_val -> eps_hat
+        scale_cache = {}       # ts_val -> pred_scale_factors
+
+        for idx, ts_val in enumerate(timesteps):
+            ts_tensor = torch.tensor(ts_val, device=x_latent.device)
+            
+            # Sample z_t ~ q(z_t | x)
+            q_t = self.q_t(x_latent, t=ts_tensor)
+            with local_seed(seed, i=ts_val):
+                z_t = q_t.sample().detach()
+            z_cache[ts_val] = z_t
+            
+            # Get score prediction at this timestep
+            eps_hat, pred_scale_factors = self._get_score_prediction(z_t, ts_tensor)
+            eps_cache[ts_val] = eps_hat.detach()
+            scale_cache[ts_val] = pred_scale_factors.detach()
+            
+            if (idx + 1) % max(1, T // 10) == 0 or (idx + 1) == T:
+                print(f"  Cached {idx + 1}/{T} timesteps")
+
+        # --- Step 2: Fill the BPP matrix using cached predictions ---
+        print(f"\nStep 2/2: Computing BPP for {total_transitions} transitions...")
+        print(f"  (Using cached predictions to compute loc/scale on-the-fly)")
+        bpp_matrix = np.zeros((T, T))
+        
+        computed = 0
+        for i, ts_t in enumerate(timesteps):
+            z_t = z_cache[ts_t]
+            eps_t = eps_cache[ts_t]
+            scale_t = scale_cache[ts_t]
+            ts_t_tensor = torch.tensor(ts_t, device=x_latent.device)
+
+            for j in range(i + 1, T):
+                ts_s = timesteps[j]
+                ts_s_tensor = torch.tensor(ts_s, device=x_latent.device)
+
+                # Compute q params: posterior given x_latent (analytic, fast)
+                q_loc, q_scale = self._compute_s_t_params_from_cache(
+                    z_t, eps_t, scale_t, ts_t_tensor, ts_s_tensor,
+                    x_latent=x_latent  # known → uses analytic posterior
+                )
+                
+                # Compute p params: prior from cached score prediction
+                p_loc, p_scale = self._compute_s_t_params_from_cache(
+                    z_t, eps_t, scale_t, ts_t_tensor, ts_s_tensor,
+                    x_latent=None     # unknown → uses cached eps_t
+                )
+
+                # Build UQDM distributions
+                q = self.q_s_t(q_loc, q_scale)
+                p = self.p_s_t(p_loc, p_scale, ts_t_tensor, ts_s_tensor)
+
+                # Average over multiple samples for better estimate
+                rate_samples = []
+                for sample_idx in range(num_samples):
+                    with local_seed(seed, i=hash((ts_t, ts_s, sample_idx))):
+                        u = torch.rand(q.mean.shape, device=q.mean.device) - 0.5
+                        
+                        # Add dither and quantize
+                        quantized = torch.round((q.mean - p.mean + p.delta * u) / p.delta)
+                        z_s = quantized * p.delta + p.mean - p.delta * u
+                        
+                        # Evaluate rate
+                        rate = - p.log_prob(z_s) - torch.log(p.delta)
+                        rate_bpp = rate.sum(dim=[1, 2, 3]).mean().item() * rescale_pixel_to_bpd
+                        rate_samples.append(rate_bpp)
+
+                bpp_matrix[i, j] = np.mean(rate_samples)
+                
+                computed += 1
+                if computed % max(1, total_transitions // 20) == 0 or computed == total_transitions:
+                    print(f"  Progress: {computed}/{total_transitions} ({100*computed/total_transitions:.1f}%)")
+
+        print(f"\nBPP matrix computation complete!")
+        return bpp_matrix, timesteps
+
+    def _get_score_prediction(self, z_t, t):
+        """
+        Run the score network once at timestep t and cache its outputs.
+        Returns eps_hat and pred_scale_factors (latter may be None).
+        """
+        gamma_t = self.gamma(t)
+        if self.config.model.get('learned_prior_scale'):
+            eps_hat, pred_scale_factors = self.score_net(z_t, gamma_t)
+        else:
+            eps_hat, pred_scale_factors = self.score_net(z_t, gamma_t)
+        return eps_hat, pred_scale_factors
+
+
+    def _compute_s_t_params_from_cache(self, z_t, eps_t, scale_t, t, s, x_latent=None):
+        """
+        Replicates get_s_t_params logic but uses cached eps_t instead of
+        calling score_net again. scale_t = cached pred_scale_factors (may be None).
+        """
+        gamma_t, gamma_s = self.gamma(t), self.gamma(s)
+        alpha_t, alpha_s = self.alpha(t), self.alpha(s)
+        sigma_t, sigma_s = self.sigma(t), self.sigma(s)
+        expm1_term = (-torch.special.expm1(gamma_s - gamma_t))
+
+        if x_latent is None:
+            # --- Prior branch: mirror get_s_t_params with x_latent=None ---
+            # Use cached eps_hat; recompute x_latent_pred only if needed for scale/loc
+            x_latent_pred = (z_t - sigma_t * eps_t) / alpha_t
+            x_latent_pred = x_latent_pred.clamp(-4.0, 4.0)
+
+            # Scale computation (mirrors get_s_t_params exactly)
+            scale = sigma_s * torch.sqrt(expm1_term)
+            if self.config.model.get('base_prior_scale', 'forward_kernel') == 'forward_kernel':
+                scale = sigma_t * torch.sqrt(expm1_term)
+            if self.config.model.get('learned_prior_scale') and scale_t is not None:
+                scale = scale * scale_t
+
+            # Loc computation (non-deterministic branch)
+            loc = alpha_s / alpha_t * (z_t - sigma_t * expm1_term * eps_t)
+
+        else:
+            # --- Posterior branch: mirror get_s_t_params with x_latent provided ---
+            scale = sigma_s * torch.sqrt(expm1_term)
+            # Non-deterministic loc with known x_latent
+            loc = alpha_s * ((1 - expm1_term) / alpha_t * z_t + expm1_term * x_latent)
+
+        return loc, scale
+    @staticmethod
+    def compute_average_bpp_matrix(bpp_matrices):
+        """
+        Average multiple BPP matrices from different images.
+        
+        Args:
+            bpp_matrices: list of [T, T] numpy arrays
+        
+        Returns:
+            avg_bpp_matrix: [T, T] numpy array with averaged values
+        """
+        return np.mean(bpp_matrices, axis=0)
+
+    @staticmethod
+    def find_optimal_path_dp(bpp_matrix, timesteps):
+        """
+        Find the optimal compression path using dynamic programming.
+        
+        Goal: Find sequence of timestep indices [0, i1, i2, ..., T-1] that minimizes
+        total BPP cost: sum of bpp_matrix[0, i1] + bpp_matrix[i1, i2] + ... + bpp_matrix[ik, T-1]
+        
+        Args:
+            bpp_matrix: [T, T] upper-triangular matrix where entry [i,j] = bpp from ts[i]→ts[j]
+            timesteps: list of timestep values corresponding to matrix indices
+        
+        Returns:
+            optimal_path: list of timestep indices [0, i1, i2, ..., T-1]
+            optimal_cost: total BPP cost of the optimal path
+            timestep_path: list of actual timestep values along the optimal path
+        """
+        T = len(bpp_matrix)
+        
+        # dp[j] = (min_cost, prev_index) to reach index j from index 0
+        # We must start at index 0 (highest timestep) and end at index T-1 (lowest timestep)
+        INF = float('inf')
+        dp = [(INF, -1) for _ in range(T)]
+        dp[0] = (0.0, -1)  # Starting point has zero cost
+        
+        # Fill DP table
+        for j in range(1, T):
+            for i in range(j):
+                # Cost to reach j from i
+                if bpp_matrix[i, j] > 0:  # Valid transition exists
+                    cost = dp[i][0] + bpp_matrix[i, j]
+                    if cost < dp[j][0]:
+                        dp[j] = (cost, i)
+        
+        # Reconstruct path by backtracking from T-1
+        optimal_cost = dp[T-1][0]
+        optimal_path = []
+        current = T - 1
+        
+        while current != -1:
+            optimal_path.append(current)
+            current = dp[current][1]
+        
+        optimal_path.reverse()
+        timestep_path = [timesteps[i] for i in optimal_path]
+        
+        return optimal_path, optimal_cost, timestep_path
+
+    @staticmethod
+    def find_optimal_path_greedy(bpp_matrix, timesteps):
+        """
+        Find a good compression path using greedy algorithm (faster but suboptimal).
+        
+        At each step, greedily choose the next timestep that minimizes BPP cost.
+        
+        Args:
+            bpp_matrix: [T, T] upper-triangular matrix where entry [i,j] = bpp from ts[i]→ts[j]
+            timesteps: list of timestep values corresponding to matrix indices
+        
+        Returns:
+            greedy_path: list of timestep indices
+            greedy_cost: total BPP cost of the greedy path
+            timestep_path: list of actual timestep values along the path
+        """
+        T = len(bpp_matrix)
+        greedy_path = [0]  # Start at index 0 (highest timestep)
+        total_cost = 0.0
+        
+        current = 0
+        while current < T - 1:
+            # Find the next step with minimum BPP cost
+            best_next = -1
+            best_cost = float('inf')
+            
+            for next_idx in range(current + 1, T):
+                if bpp_matrix[current, next_idx] > 0:  # Valid transition
+                    if bpp_matrix[current, next_idx] < best_cost:
+                        best_cost = bpp_matrix[current, next_idx]
+                        best_next = next_idx
+            
+            if best_next == -1:
+                # No valid next step, jump to end
+                break
+            
+            greedy_path.append(best_next)
+            total_cost += best_cost
+            current = best_next
+        
+        # Ensure we end at T-1
+        if greedy_path[-1] != T - 1:
+            greedy_path.append(T - 1)
+            total_cost += bpp_matrix[greedy_path[-2], T - 1]
+        
+        timestep_path = [timesteps[i] for i in greedy_path]
+        
+        return greedy_path, total_cost, timestep_path
+
+import seaborn as sns
+def plot_bpp_matrix(bpp_matrix, timesteps, optimal_path=None):
+    """
+    Plot the BPP matrix, optionally highlighting the optimal path.
+    
+    Args:
+        bpp_matrix: [T, T] BPP cost matrix
+        timesteps: list of timesteps
+        optimal_path: optional list of indices representing the path to highlight
+    """
+    fig, ax = plt.subplots(figsize=(10, 8))
+    sns.heatmap(
+        bpp_matrix,
+        xticklabels=[str(t) for t in timesteps],
+        yticklabels=[str(t) for t in timesteps],
+        annot=True, fmt=".3f",
+        mask=(bpp_matrix == 0),   # hide lower triangle
+        cmap="viridis", ax=ax,
+        cbar_kws={'label': 'BPP'}
+    )
+    
+    # Highlight optimal path if provided
+    if optimal_path is not None:
+        for i in range(len(optimal_path) - 1):
+            ax.add_patch(plt.Rectangle(
+                (optimal_path[i+1], optimal_path[i]), 1, 1,
+                fill=False, edgecolor='red', lw=3
+            ))
+        ax.set_title(f"BPP matrix with optimal path (highlighted in red)")
+    else:
+        ax.set_title("BPP matrix: compression cost (bits-per-pixel) from t (row) → s (col)")
+    
+    ax.set_xlabel("Target timestep s")
+    ax.set_ylabel("Source timestep t")
+    plt.tight_layout()
+    plt.savefig("bpp_matrix.png", dpi=150)
+
+
+def find_optimal_path_dp(bpp_matrix, timesteps):
+    """
+    Find the optimal compression path using dynamic programming.
+    
+    Goal: Find the sequence of timesteps from timesteps[0] (largest, e.g., 999) 
+    to timesteps[-1] (smallest, e.g., 0) that minimizes total BPP.
+    
+    Args:
+        bpp_matrix: [T, T] numpy array where bpp_matrix[i, j] = cost from timesteps[i] → timesteps[j]
+        timesteps: list of timesteps corresponding to matrix indices
+    
+    Returns:
+        optimal_path: list of timestep indices representing the best path
+        total_bpp: total compression cost along the optimal path
+        path_timesteps: list of actual timestep values along the path
+    """
+    T = len(timesteps)
+    
+    # dp[i] = (min_cost_to_reach_i, previous_index)
+    # Initialize: start at index 0 (largest timestep)
+    dp = [(float('inf'), -1) for _ in range(T)]
+    dp[0] = (0.0, -1)  # Starting point has 0 cost
+    
+    # Fill DP table
+    for i in range(T):
+        if dp[i][0] == float('inf'):
+            continue
+            
+        # Try all possible next steps from position i
+        for j in range(i + 1, T):
+            # Cost to go from i to j
+            step_cost = bpp_matrix[i, j]
+            total_cost = dp[i][0] + step_cost
+            
+            # Update if this path is better
+            if total_cost < dp[j][0]:
+                dp[j] = (total_cost, i)
+    
+    # Backtrack to find the path
+    optimal_path = []
+    current = T - 1  # End at the last timestep
+    
+    while current != -1:
+        optimal_path.append(current)
+        current = dp[current][1]
+    
+    optimal_path.reverse()
+    total_bpp = dp[T - 1][0]
+    path_timesteps = [timesteps[i] for i in optimal_path]
+    
+    return optimal_path, total_bpp, path_timesteps
+
+
+@staticmethod
+def _gaussian_kl(q_loc, q_scale, p_loc, p_scale):
+    """
+    KL( N(q_loc, q_scale^2) || N(p_loc, p_scale^2) ) elementwise.
+    Returns tensor same shape as inputs.
+    
+    Note: This is kept for compatibility but not used in UQDM BPP matrix computation.
+    UQDM uses the rate computation from relative_entropy_coding instead, which properly
+    accounts for uniform quantization and discretization in the compression task.
+    """
+    return (
+        torch.log(p_scale / q_scale.clamp(1e-8))
+        + (q_scale**2 + (q_loc - p_loc)**2) / (2 * p_scale**2 + 1e-8)
+        - 0.5
+    )
 if __name__ == '__main__':
     import os
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
@@ -1290,6 +1673,34 @@ if __name__ == '__main__':
     bpps = np.array(bpps)
     psnrs = np.array(psnrs)
 
+    # --- R-D curve (your existing code) ---
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(bpps, psnrs, '-', label='UQDM', linewidth=2, color='orange')
+    ax.set_xlabel('Rate (BPP)', fontsize=13)
+    ax.set_ylabel('PSNR (dB)', fontsize=13)
+    ax.set_title('UQDM: Rate-Distortion Curve', fontsize=14)
+    ax.legend(fontsize=12, loc='lower right')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('uqdm_sd_rd_curve_64.png', dpi=150, bbox_inches='tight')
+    print("Saved plot to uqdm_sd_rd_curve.png")
+
+    # --- KL matrix on a single batch ---
+    sample_batch = next(iter(eval_iter)).to(device)   # grab one batch
+
+    bpp_matrix, timesteps = model.compute_bpp_matrix(
+        sample_batch,
+        seed=seed,
+        timestep_stride=1   # gives ~10 timesteps: [999, 899, ..., 99, 0]
+    )
+    print(123)
+    optimal_path, total_bpp, path_timesteps = find_optimal_path_dp(bpp_matrix, timesteps)
+    print(234)
+    plot_bpp_matrix(bpp_matrix, timesteps)
+    print("Saved BPP matrix to bpp_matrix.png")
+    print(f"Compress using timesteps: {path_timesteps}")
+
+
 
 
 
@@ -1301,5 +1712,5 @@ if __name__ == '__main__':
     ax.legend(fontsize=12, loc='lower right')
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig('uqdm_sd_rd_curve_512.png', dpi=150, bbox_inches='tight')
+    plt.savefig('uqdm_sd_rd_curve_64.png', dpi=150, bbox_inches='tight')
     print("Saved plot to uqdm_sd_rd_curve.png")
