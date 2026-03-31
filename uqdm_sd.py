@@ -58,8 +58,10 @@ class SD15ScoreNet(torch.nn.Module):
             nn.Conv2d(64, 4, kernel_size=1),
         ).cuda()
 
-        # Zero-init the last layer for stable training start
-        nn.init.zeros_(self.scale_head[-1].weight)
+        # # Zero-init the last layer for stable training start
+        nn.init.kaiming_normal_(self.scale_head[0].weight, mode='fan_out', nonlinearity='relu')
+        nn.init.zeros_(self.scale_head[0].bias)
+        nn.init.xavier_normal_(self.scale_head[-1].weight, gain=0.01)  # small but non-zero
         nn.init.zeros_(self.scale_head[-1].bias)
 
         self._penultimate_latent = None
@@ -93,9 +95,9 @@ class SD15ScoreNet(torch.nn.Module):
 
         # _penultimate_latent was captured inside the no_grad block, so we must
         # re-enable grad for the scale_head branch
-        penultimate = self._penultimate_latent.detach().requires_grad_(True)
-        pred_scale_factors = self.softplus_init1(self.scale_head(penultimate))
+        penultimate = self._penultimate_latent
 
+        pred_scale_factors = self.softplus_init1(self.scale_head(penultimate))
         return eps_hat, pred_scale_factors
 class ExponentialMovingAverage:
     """
@@ -291,12 +293,14 @@ def load_data_from_folder():
             ])
             self.image_paths = list(self.folder_path.glob('*.jpg')) + \
                               list(self.folder_path.glob('*.png')) + \
-                              list(self.folder_path.glob('*.jpeg'))
+                              list(self.folder_path.glob('*.jpeg')) +\
+                              list(self.folder_path.glob('*.JPEG'))
             
         def __len__(self):
             return len(self.image_paths)
         
         def __getitem__(self, idx):
+
             img_path = self.image_paths[idx]
             image = Image.open(img_path).convert('RGB')
             if self.transform:
@@ -309,20 +313,21 @@ def load_data_from_folder():
     ])
     
     full_dataset = ImageFolderFlat('data_1/', transform=transform)
-    
+    full_dataset = torch.utils.data.Subset(full_dataset, range(100)) 
     total_size = len(full_dataset)
+    print(total_size)
     train_size = int(0.8 * total_size)
     eval_size = total_size - train_size
-    
+    print(train_size,eval_size)
     train_data, eval_data = random_split(full_dataset, [train_size, eval_size])
     
     train_iter = DataLoader(train_data, batch_size=32, shuffle=True,
-                           pin_memory=True, num_workers=1)
-    eval_iter = DataLoader(eval_data, batch_size=32, shuffle=False,
-                          pin_memory=True, num_workers=1)
+                           pin_memory=True, num_workers=0)
+    eval_iter = DataLoader(eval_data, batch_size=1, shuffle=False,
+                          pin_memory=True, num_workers=0)
     
     train_iter = cycle(train_iter)
-    
+
     return train_iter, eval_iter
 def load_data(dataspec, cfg):
     """
@@ -358,9 +363,7 @@ def load_checkpoint_SD(config_path=None, ckpt_path=None):
     ckpt_path:   path to a .pt file containing scale_head weights. If None, uses random init.
 
     Examples:
-        load_checkpoint_SD()                                         # fresh random init
-        load_checkpoint_SD('checkpoints/uqdm-medium')               # config only, random weights
-        load_checkpoint_SD('checkpoints/uqdm-medium', 'checkpoints/uqdm-medium/ckpt_0001000.pt')
+
     """
     if config_path is not None:
         with open(os.path.join(config_path, 'config.json'), 'r') as f:
@@ -775,7 +778,6 @@ class Diffusion_SD(torch.nn.Module):
         if x_latent is None:
             # Predict noise using score network
             if self.config.model.get('learned_prior_scale'):
-
                 eps_hat, pred_scale_factors = self.score_net(z_t, gamma_t)
 
 
@@ -844,119 +846,7 @@ class Diffusion_SD(torch.nn.Module):
             self.compress_bits += [self.entropy_encode(x_raw, p)]
         return x_raw
 
-    def forward(self, x_raw, z_1=None, recon_method=None, compress_mode=None, seed=None):
-        """
-        x_raw: [B, 3, H, W] in range [0, 255]
-        Everything else happens in latent space
-        """
-
-        
-
-        # Encode to latent space ONCE at the beginning
-        x_pixel = 2 * ((x_raw.float() + .5) / self.config.model.vocab_size) - 1  # [-1, 1]
-        with torch.no_grad():
-            x_latent = self.vae.encode(x_pixel).latent_dist.sample() * self.vae_scale_factor
-            x_latent = x_latent.detach()
-        rescale_latent_to_bpd = 1. / (np.prod(x_latent.shape[1:]) * np.log(2.))
-        rescale_pixel_to_bpd = 1. / (np.prod(x_raw.shape[1:]) * np.log(2.))
-
-
-        # 1. PRIOR/LATENT LOSS - now in latent space
-        if z_1 is None and not torch.is_inference_mode_enabled():
-            q_1 = self.q_t(x_latent)
-            p_1 = self.p_1()
-            with local_seed(seed, i=0):
-                z_1 = q_1.sample()
-            loss_prior = kl_divergence(q_1, p_1).sum(dim=[1, 2, 3])
-        else:
-            if z_1 is None:
-                p_1 = self.p_1()
-                with local_seed(seed, i=0):
-                    z_1 = p_1.sample(x_latent.shape)  # Sample in latent space shape
-            loss_prior = torch.zeros(x_latent.shape[0], device=device)
-
-        # 2. DIFFUSION LOSS - all in latent space
-        # 2. DIFFUSION LOSS - all in latent space
-        z_s = z_1
-        rate_s = loss_prior
-        loss_diff = 0.
-        sd_timesteps = self.sd_scheduler.timesteps  # tensor([999, 998, ..., 0])
-        total_steps = len(sd_timesteps) - 1
-        
-        # Generate eval_indices based on total_steps, including both endpoints
-        n_eval_samples = 8  # Customize this number
-        # eval_indices = np.linspace(0, total_steps - 1, n_eval_samples, dtype=int)
-        # eval_indices_set = set(eval_indices)  # Convert to set for O(1) lookup
-        
-        metrics = []
-
-        for i in range(total_steps):
-            z_t = z_s
-            rate_t = rate_s
-            ts_t = sd_timesteps[i].item()
-            ts_s = sd_timesteps[i + 1].item()
-
-            with local_seed(seed, i=i + 1):
-                z_s, rate_s = self.transmit_q_s_t(
-                    x_latent, z_t, ts_t, ts_s,
-                    compress_mode=compress_mode,
-                    cache_denoised=recon_method == 'denoise',
-                    x_raw=x_raw
-                )
-            loss_diff += rate_s
-
-            # Only store metrics at eval_indices
-            if recon_method is not None :
-                x_hat_t = self.denoise_z_t(z_t, recon_method, times=ts_t)
-                metrics += [{
-                    'prog_bpds': rate_t.cpu() * rescale_pixel_to_bpd,  # per-step, same as original
-                    'prog_x_hats': x_hat_t.detach().cpu(),
-                    'prog_mses': torch.mean((x_hat_t - x_raw).float() ** 2, dim=[1, 2, 3]).cpu(),
-                }]
-        z_0_latent = z_s
-        
-        if recon_method is not None:
-            if recon_method == 'ancestral':
-                x_hat_t = self.decode_p_x_z_0(z_0_latent=z_0_latent, method='sample')
-            else:
-                x_hat_t = self.decode_p_x_z_0(z_0_latent=z_0_latent, method='argmax')
-            metrics += [{
-                'prog_bpds': rate_s.cpu() * rescale_pixel_to_bpd,
-                'prog_x_hats': x_hat_t.detach().cpu(),
-                'prog_mses': torch.mean((x_hat_t - x_raw).float() ** 2, dim=[1, 2, 3]).cpu(),
-            }]
-
-        # 3. RECONSTRUCTION LOSS
-        log_probs = self.log_probs_x_z0(z_0_latent=z_0_latent, x_raw=x_raw)
-        
-        loss_recon = -log_probs.sum(dim=[1, 2, 3])
-        x_raw = self.transmit_image(z_0_latent, x_raw, compress_mode=compress_mode)
-
-        if recon_method is not None:
-            metrics += [{
-                'prog_bpds': loss_recon.cpu() * rescale_pixel_to_bpd,
-                'prog_x_hats': x_raw.cpu(),
-                'prog_mses': torch.zeros(x_pixel.shape[:1]),
-            }]
-            metrics = default_collate(metrics)
-        else:
-            metrics = {}
-        bpd_latent = torch.mean(loss_prior) * rescale_latent_to_bpd
-        bpd_diff   = torch.mean(loss_diff)  * rescale_latent_to_bpd
-        bpd_recon  = torch.mean(loss_recon) * rescale_pixel_to_bpd
-        loss = bpd_recon + bpd_latent + bpd_diff
-
-        metrics.update({
-            "bpd": loss,
-            "bpd_latent": bpd_latent,
-            "bpd_recon": bpd_recon,
-            "bpd_diff": bpd_diff,
-        })
-
-        return loss, metrics
-
-
-
+    
 
     @torch.no_grad()
     def sample(self, init_z=None, shape=None, times=None, deterministic=False,
@@ -1003,7 +893,154 @@ class Diffusion_SD(torch.nn.Module):
         if return_hist:
             return x_raw, samples + [x_raw]
         return x_raw
-    
+    def forward(self, x_raw, z_1=None, recon_method=None, compress_mode=None, seed=None):
+
+        x_pixel = 2 * ((x_raw.float() + .5) / self.config.model.vocab_size) - 1
+        with torch.no_grad():
+            x_latent = self.vae.encode(x_pixel).latent_dist.sample() * self.vae_scale_factor
+            x_latent = x_latent.detach()
+
+        rescale_latent_to_bpd = 1. / (np.prod(x_latent.shape[1:]) * np.log(2.))
+        rescale_pixel_to_bpd  = 1. / (np.prod(x_raw.shape[1:])   * np.log(2.))
+
+        sd_timesteps = self.sd_scheduler.timesteps   # [999, 998, ..., 0]
+        total_steps  = len(sd_timesteps) - 1         # 999
+
+        # ------------------------------------------------------------------ #
+        # 1. PRIOR LOSS  (unchanged)
+        # ------------------------------------------------------------------ #
+        if z_1 is None and not torch.is_inference_mode_enabled():
+            q_1   = self.q_t(x_latent, t=1)
+            p_1   = self.p_1()
+            with local_seed(seed, i=0):
+                z_1 = q_1.sample()
+            loss_prior = kl_divergence(q_1, p_1).sum(dim=[1, 2, 3])
+        else:
+            if z_1 is None:
+                p_1 = self.p_1()
+                with local_seed(seed, i=0):
+                    z_1 = p_1.sample(x_latent.shape)
+            loss_prior = torch.zeros(x_latent.shape[0], device=device)
+
+        # ------------------------------------------------------------------ #
+        # 2. DIFFUSION LOSS — single random timestep (replaces 1000-step loop)
+        # ------------------------------------------------------------------ #
+        if not torch.is_inference_mode_enabled():
+            # Sample a random index into the timestep schedule
+            # rand_idx ∈ {0, 1, ..., total_steps-1}
+            rand_idx = torch.randint(0, total_steps, (1,)).item()
+
+            ts_t = sd_timesteps[rand_idx].item()       # e.g. 742  (the "t" step)
+            ts_s = sd_timesteps[rand_idx + 1].item()   # e.g. 741  (the "s" step)
+
+            # --- Sample z_t in ONE shot via the closed-form marginal ----------
+            # q(z_t | x_latent) = N(alpha_t * x_latent, sigma_t^2)
+            # This replaces the entire sequential z_1 -> ... -> z_t chain
+            q_t_dist = self.q_t(x_latent, t=ts_t)
+            with local_seed(seed, i=rand_idx + 1):
+                z_t = q_t_dist.sample()               # [B, 4, H/8, W/8]
+
+            # --- Single KL step, scaled by total_steps (unbiased estimator) --
+            p_loc, p_scale = self.get_s_t_params(
+                z_t, ts_t, ts_s,
+                cache_denoised=(recon_method == 'denoise'),
+                x_raw_debug=x_raw
+            )
+            q_loc, q_scale = self.get_s_t_params(
+                z_t, ts_t, ts_s,
+                x_latent=x_latent,
+                x_raw_debug=x_raw
+            )
+            p_s_t = self.p_s_t(p_loc, p_scale, ts_t, ts_s)
+            q_s_t = self.q_s_t(q_loc, q_scale)
+
+            # rate shape: [B, 4, H/8, W/8] — KL for this ONE step
+            # Multiply by total_steps → unbiased estimate of the full sum
+            _, rate_one_step = self.relative_entropy_coding(
+                q_s_t, p_s_t, compress_mode=compress_mode
+            )
+            loss_diff = rate_one_step    # [B, 4, H/8, W/8] summed below
+
+        else:
+            # ---- Inference / eval: keep the full sequential loop -------------
+            z_s    = z_1
+            rate_s = loss_prior
+            loss_diff = 0.
+            metrics = []
+
+            for i in range(total_steps):
+                z_t_loop = z_s
+                rate_t   = rate_s
+                ts_t = sd_timesteps[i].item()
+                ts_s = sd_timesteps[i + 1].item()
+
+                with local_seed(seed, i=i + 1):
+                    z_s, rate_s = self.transmit_q_s_t(
+                        x_latent, z_t_loop, ts_t, ts_s,
+                        compress_mode=compress_mode,
+                        cache_denoised=(recon_method == 'denoise'),
+                        x_raw=x_raw
+                    )
+                loss_diff += rate_s
+
+                if recon_method is not None:
+                    x_hat_t = self.denoise_z_t(z_t_loop, recon_method, times=ts_t)
+                    metrics += [{
+                        'prog_bpds': rate_t.cpu() * rescale_pixel_to_bpd,
+                        'prog_x_hats': x_hat_t.detach().cpu(),
+                        'prog_mses': torch.mean((x_hat_t - x_raw).float() ** 2, dim=[1, 2, 3]).cpu(),
+                    }]
+
+            z_0_latent = z_s
+
+        # ------------------------------------------------------------------ #
+        # 3. RECONSTRUCTION LOSS  (unchanged)
+        # ------------------------------------------------------------------ #
+        # For training we need z_0: sample it directly from q(z_0 | x_latent)
+        if not torch.is_inference_mode_enabled():
+            ts_0       = sd_timesteps[-1].item()   # timestep 0
+            q_0_dist   = self.q_t(x_latent, t=ts_0)
+            z_0_latent = q_0_dist.sample()
+
+        log_probs  = self.log_probs_x_z0(z_0_latent=z_0_latent, x_raw=x_raw)
+        loss_recon = -log_probs.sum(dim=[1, 2, 3])
+        x_raw      = self.transmit_image(z_0_latent, x_raw, compress_mode=compress_mode)
+
+        # ------------------------------------------------------------------ #
+        # 4. Aggregate
+        # ------------------------------------------------------------------ #
+        bpd_latent = torch.mean(loss_prior)    * rescale_latent_to_bpd
+        bpd_diff   = torch.mean(loss_diff)    * rescale_latent_to_bpd
+        bpd_recon  = torch.mean(loss_recon)   * rescale_pixel_to_bpd
+        loss       = bpd_recon + bpd_latent + bpd_diff
+
+        if torch.is_inference_mode_enabled() and recon_method is not None:
+            if recon_method == 'ancestral':
+                x_hat_t = self.decode_p_x_z_0(z_0_latent=z_0_latent, method='sample')
+            else:
+                x_hat_t = self.decode_p_x_z_0(z_0_latent=z_0_latent, method='argmax')
+            metrics += [{
+                'prog_bpds': rate_s.cpu() * rescale_pixel_to_bpd,
+                'prog_x_hats': x_hat_t.detach().cpu(),
+                'prog_mses': torch.mean((x_hat_t - x_raw).float() ** 2, dim=[1, 2, 3]).cpu(),
+            }]
+            metrics += [{
+                'prog_bpds': loss_recon.cpu() * rescale_pixel_to_bpd,
+                'prog_x_hats': x_raw.cpu(),
+                'prog_mses': torch.zeros(x_pixel.shape[:1]),
+            }]
+            metrics = default_collate(metrics)
+        else:
+            metrics = {}
+
+        metrics.update({
+            "bpd":        loss,
+            "bpd_latent": bpd_latent,
+            "bpd_recon":  bpd_recon,
+            "bpd_diff":   bpd_diff,
+        })
+
+        return loss, metrics
 
     def entropy_encode(self, k, p):
         """
@@ -1164,11 +1201,23 @@ class Diffusion_SD(torch.nn.Module):
         print(f'Saved checkpoint → {path}')
 
 
-    def load(self):
-        print(1231)
+    def load(self, ckpt_path=None):
         from diffusers import DDPMScheduler, UNet2DConditionModel
 
         self.score_net = SD15ScoreNet(self.config)
+
+        if ckpt_path is not None:
+            cp = torch.load(ckpt_path, map_location=device, weights_only=False)
+            self.score_net.scale_head.load_state_dict(cp['scale_head'])
+            if 'optimizer' in cp:
+                self.optimizer.load_state_dict(cp['optimizer'])
+            if 'ema' in cp:
+                self.ema.load_state_dict(cp['ema'])
+            if 'step' in cp:
+                self.step = cp['step']
+            print(f'Loaded scale_head weights from {ckpt_path}')
+        else:
+            print('No checkpoint provided — scale_head randomly initialised.')
 
 
 
@@ -1388,9 +1437,9 @@ class UQDM_SD(Diffusion_SD):
             z_cache     = {}
             eps_cache   = {}
             scale_cache = {}
-
+            psnr_accum = np.zeros(T)
             print(f"  Caching z_t and score predictions for {T} timesteps...")
-            for ts_val in timesteps:
+            for idx, ts_val in enumerate(timesteps):
                 ts_tensor = torch.tensor(ts_val, device=x_latent.device)
                 alpha_t   = self.alpha(ts_tensor)
                 sigma_t   = self.sigma(ts_tensor)
@@ -1406,6 +1455,9 @@ class UQDM_SD(Diffusion_SD):
                     eps_hat, _ = self.score_net(z_t, gamma_t)
                     scale_cache[ts_val] = None
                 eps_cache[ts_val] = eps_hat.detach()
+                x_hat = (z_t - sigma_t * eps_hat) / alpha_t
+                x_hat = x_hat.clamp(-4.0, 4.0)
+                psnr_accum[idx] += compute_psnr(x_hat, x_latent)
 
             # --- Fill cost matrix ---
             cost_matrix_img = np.zeros((T, T))
@@ -1463,11 +1515,12 @@ class UQDM_SD(Diffusion_SD):
 
         # --- Final average ---
         cost_matrix = cost_matrix_accum / num_images
+        psnr_per_timestep = psnr_accum / num_images
         consecutive_bpp = sum(cost_matrix[i, i+1] for i in range(T-1))
 
 
 
-        return cost_matrix, timesteps
+        return cost_matrix, timesteps, psnr_per_timestep
     def _get_posterior_params(self, z_t, t, s, x_latent, eps_t, scale_t):
         """Extract q(z_s | z_t, x) loc and scale."""
         alpha_t  = self.alpha(t)
@@ -1499,7 +1552,14 @@ class UQDM_SD(Diffusion_SD):
         return p_loc, p_scale
 import time
 import numpy as np
-
+def compute_psnr(pred, target, max_val=None):
+    """Compute PSNR between pred and target tensors."""
+    if max_val is None:
+        max_val = target.abs().max().item()
+    mse = ((pred - target) ** 2).mean().item()
+    if mse == 0:
+        return float('inf')
+    return 10 * np.log10((max_val ** 2) / mse)
 def find_optimal_path_dp(bpp_matrix, timesteps):
     """
     Find optimal transmission path via DP using raw KL-based bpp.
@@ -1523,30 +1583,30 @@ def find_optimal_path_dp(bpp_matrix, timesteps):
 
     threshold = 1e-4  # tunable
 
-    for i in range(T):
-        for k in range(i+1, T):
-            for j in range(k+1, T):
-                direct    = bpp_matrix[i, j]
-                via_k     = bpp_matrix[i, k] + bpp_matrix[k, j]
-                violation = abs(direct - via_k)
-                rel_violation = violation / (via_k + 1e-10)  # relative to path cost
+    # for i in range(T):
+    #     for k in range(i+1, T):
+    #         for j in range(k+1, T):
+    #             direct    = bpp_matrix[i, j]
+    #             via_k     = bpp_matrix[i, k] + bpp_matrix[k, j]
+    #             violation = abs(direct - via_k)
+    #             rel_violation = violation / (via_k + 1e-10)  # relative to path cost
 
-                max_violation      = max(max_violation, violation)
-                sum_violation     += violation
-                sum_relative_violation += rel_violation
-                total_triples     += 1
-                if violation > threshold:
-                    violated_triples += 1
+    #             max_violation      = max(max_violation, violation)
+    #             sum_violation     += violation
+    #             sum_relative_violation += rel_violation
+    #             total_triples     += 1
+    #             if violation > threshold:
+    #                 violated_triples += 1
 
-    mean_violation          = sum_violation / total_triples
-    mean_relative_violation = sum_relative_violation / total_triples
-    pct_violated            = 100 * violated_triples / total_triples
+    # mean_violation          = sum_violation / total_triples
+    # mean_relative_violation = sum_relative_violation / total_triples
+    # pct_violated            = 100 * violated_triples / total_triples
 
-    print(f"Total triples checked : {total_triples}")
-    print(f"Max violation         : {max_violation:.8f}")
-    print(f"Mean violation        : {mean_violation:.8f}")
-    print(f"Mean relative violation: {mean_relative_violation*100:.4f}%")
-    print(f"Triples with violation > {threshold}: {violated_triples} ({pct_violated:.2f}%)")  # ← insert here
+    # print(f"Total triples checked : {total_triples}")
+    # print(f"Max violation         : {max_violation:.8f}")
+    # print(f"Mean violation        : {mean_violation:.8f}")
+    # print(f"Mean relative violation: {mean_relative_violation*100:.4f}%")
+    # print(f"Triples with violation > {threshold}: {violated_triples} ({pct_violated:.2f}%)")  # ← insert here
 
     INF = float('inf')
 
@@ -1594,61 +1654,41 @@ def find_optimal_path_dp(bpp_matrix, timesteps):
     print(f"  Timestep path       : {timestep_path}")
 
     return optimal_path, timestep_path, bpp_breakdown
-def check_additivity(cost_matrix, timesteps, max_skip=None):
-    """
-    Check if cost_matrix[i,j] ≈ cost_matrix[i,k] + cost_matrix[k,j] for all i < k < j.
-    
-    max_skip: only check transitions up to this distance apart (None = check all)
-    """
-    T = len(cost_matrix)
-    max_violation = 0
-    worst_triple  = None
-    
-    violations_by_distance = {}
+def plot_uqdm_analysis(cost_matrix, timesteps, psnr_per_timestep):
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    T = len(timesteps)
 
-    for i in range(T):
-        for j in range(i + 2, T):  # need at least one k in between
-            if max_skip and (j - i) > max_skip:
-                continue
-            direct = cost_matrix[i, j]
-            for k in range(i + 1, j):
-                via_k     = cost_matrix[i, k] + cost_matrix[k, j]
-                violation = direct - via_k  # positive = direct is MORE expensive than going via k
-                abs_viol  = abs(violation)
+    # --- 1. Cost Matrix Heatmap ---
+    ax1 = axes[0]
+    mask = np.tril(np.ones_like(cost_matrix, dtype=bool))
+    masked = np.ma.masked_where(mask, cost_matrix)
 
-                dist = j - i
-                violations_by_distance.setdefault(dist, []).append(violation)
+    im = ax1.imshow(masked, aspect='auto', origin='upper', cmap='viridis')
+    plt.colorbar(im, ax=ax1, label='BPP')
+    ax1.set_title('UQDM Cost Matrix (BPP)')
+    ax1.set_xlabel('Target timestep index (j)')
+    ax1.set_ylabel('Source timestep index (i)')
 
-                if abs_viol > max_violation:
-                    max_violation = abs_viol
-                    worst_triple  = (i, k, j, direct, via_k, violation)
+    tick_stride = max(1, T // 10)
+    tick_indices = list(range(0, T, tick_stride))
+    tick_labels  = [str(timesteps[i]) for i in tick_indices]
+    ax1.set_xticks(tick_indices); ax1.set_xticklabels(tick_labels, rotation=45, ha='right', fontsize=8)
+    ax1.set_yticks(tick_indices); ax1.set_yticklabels(tick_labels, fontsize=8)
 
-    print(f"\n{'='*60}")
-    print(f"Additivity Check")
-    print(f"{'='*60}")
-    print(f"Max violation        : {max_violation:.8f}")
-    if worst_triple:
-        i, k, j, direct, via_k, viol = worst_triple
-        print(f"Worst triple         : i={i}(t={timesteps[i]}), k={k}(t={timesteps[k]}), j={j}(t={timesteps[j]})")
-        print(f"  direct  [i→j]      : {direct:.6f} bpp")
-        print(f"  via k   [i→k]+[k→j]: {via_k:.6f} bpp")
-        print(f"  violation (d - via) : {viol:.6f}  ({'direct cheaper = skip beneficial' if viol < 0 else 'direct costlier = skip harmful'})")
+    # --- 2. PSNR vs Timestep ---
+    ax2 = axes[1]
+    ax2.plot(timesteps, psnr_per_timestep, color='royalblue', linewidth=1.8, marker='o', markersize=3)
+    ax2.set_title('PSNR per Timestep')
+    ax2.set_xlabel('Timestep')
+    ax2.set_ylabel('PSNR (dB)')
+    ax2.invert_xaxis()
+    ax2.grid(True, linestyle='--', alpha=0.4)
 
-    print(f"\nViolation by skip distance:")
-    print(f"{'Distance':>10} {'Mean viol':>12} {'Max viol':>12} {'Min viol':>12} {'% negative':>12}")
-    for dist in sorted(violations_by_distance.keys()):
-        v = np.array(violations_by_distance[dist])
-        pct_neg = 100 * (v < 0).mean()  # % of cases where skipping is beneficial
-        print(f"{dist:>10} {v.mean():>12.6f} {v.max():>12.6f} {v.min():>12.6f} {pct_neg:>11.1f}%")
+    plt.tight_layout()
+    plt.savefig('uqdm_analysis.png', dpi=150, bbox_inches='tight')
 
-    print(f"{'='*60}")
-    print("Interpretation:")
-    print("  violation ≈ 0       → rate is additive, DP finds no real savings")
-    print("  violation < 0       → direct skip is CHEAPER than going via k (DP skipping is valid)")
-    print("  violation > 0       → direct skip is MORE expensive (consecutive steps are better)")
-    print(f"{'='*60}\n")
 
-    return violations_by_distance
+
 if __name__ == '__main__':
     import os
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
@@ -1657,66 +1697,67 @@ if __name__ == '__main__':
     torch.manual_seed(seed)
     torch.use_deterministic_algorithms(True)
 
-    model = load_checkpoint_SD(config_path='checkpoints/uqdm-small',ckpt_path=None)
+    model = load_checkpoint_SD(config_path='checkpoints/uqdm-small',ckpt_path="checkpoints/uqdm-sd/ckpt_0005000.pt")
     train_iter, eval_iter = load_data_from_folder()
     # model.trainer(train_iter, eval_iter)
 
-    # bpps, psnrs = model.evaluate(eval_iter, n_batches=10, seed=seed)
-    # bpps = np.array(bpps)
-    # psnrs = np.array(psnrs)
+    bpps, psnrs = model.evaluate(eval_iter, n_batches=3, seed=seed)
+    bpps = np.array(bpps)
+    psnrs = np.array(psnrs)
 
     # # --- R-D curve (your existing code) ---
-    # fig, ax = plt.subplots(figsize=(10, 6))
-    # ax.plot(bpps, psnrs, '-', label='UQDM', linewidth=2, color='orange')
-    # ax.set_xlabel('Rate (BPP)', fontsize=13)
-    # ax.set_ylabel('PSNR (dB)', fontsize=13)
-    # ax.set_title('UQDM: Rate-Distortion Curve', fontsize=14)
-    # ax.legend(fontsize=12, loc='lower right')
-    # ax.grid(True, alpha=0.3)
-    # plt.tight_layout()
-    # plt.savefig('uqdm_sd_rd_curve_64.png', dpi=150, bbox_inches='tight')
-    # print("Saved plot to uqdm_sd_rd_curve.png")
-    sample_batch = next(iter(eval_iter)).to(device)   # grab one batch
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(bpps, psnrs, '-', label='UQDM', linewidth=2, color='orange')
+    ax.set_xlabel('Rate (BPP)', fontsize=13)
+    ax.set_ylabel('PSNR (dB)', fontsize=13)
+    ax.set_title('UQDM: Rate-Distortion Curve', fontsize=14)
+    ax.legend(fontsize=12, loc='lower right')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('uqdm_sd_rd_curve_64.png', dpi=150, bbox_inches='tight')
+    print("Saved plot to uqdm_sd_rd_curve.png")
+    # sample_batch = next(iter(train_iter)).to(device)   # grab one batch
 
-    cost_matrix, timesteps = model.compute_cost_matrix_uqdm(
-        iter(eval_iter),       # pass an iterator, not a batch
-        seed=seed,
-        timestep_stride=1,
-        num_images=1,         # average over 50 real images
-        cache_path="cache/cost_matrix_stride100.npz"
-    )
-    # check_triangle_inequality(cost_matrix)
-    # violations_by_distance = check_additivity(cost_matrix, timesteps, max_skip=4)
-
-    torch.set_printoptions(precision=2, sci_mode=False)
-
-    optimal_path,  path_timesteps, breakdown = find_optimal_path_dp(cost_matrix, timesteps)
-    raw_bpp_optimal = sum(cost_matrix[optimal_path[k], optimal_path[k+1]] for k in range(len(optimal_path)-1))
-
-    print(f"{breakdown['optimal_total_bpp']:.6f} bpp", breakdown['consecutive_bpp'], )
-    print(f"{breakdown['num_transitions']:.2f} transitions  ", breakdown['saving_bpp'])
-
-    import numpy as np
-    np.set_printoptions(precision=3, suppress=True)
-
-
-    # Check if big skip is really cheaper than sum of small steps
-    sum_consecutive = sum(cost_matrix[i,i+1] for i in range(len(timesteps)-1))
-    big_skip = cost_matrix[0, -1]
-    # # --- KL matrix on a single batch ---
-    # sample_batch = next(iter(eval_iter)).to(device)   # grab one batch
-
-    # bpp_matrix, timesteps = model.compute_bpp_matrix(
-    #     sample_batch,
+    # cost_matrix, timesteps, psnr_per_timestep = model.compute_cost_matrix_uqdm(
+    #     iter(train_iter),       # pass an iterator, not a batch
     #     seed=seed,
-    #     timestep_stride=1   # gives ~10 timesteps: [999, 899, ..., 99, 0]
+    #     timestep_stride=1,
+    #     num_images=3,         # average over 50 real images
+    #     cache_path=""
     # )
-    # print(123)
-    # optimal_path, total_bpp, path_timesteps = find_optimal_path_dp(bpp_matrix, timesteps)
-    # print(234)
-    # plot_bpp_matrix(bpp_matrix, timesteps)
-    # print("Saved BPP matrix to bpp_matrix.png")
-    # print(f"Compress using timesteps: {path_timesteps}")
+    # plot_uqdm_analysis(cost_matrix, timesteps, psnr_per_timestep)
+    # # check_triangle_inequality(cost_matrix)
+    # # violations_by_distance = check_additivity(cost_matrix, timesteps, max_skip=4)
+
+    # torch.set_printoptions(precision=2, sci_mode=False)
+
+    # optimal_path,  path_timesteps, breakdown = find_optimal_path_dp(cost_matrix, timesteps)
+    # raw_bpp_optimal = sum(cost_matrix[optimal_path[k], optimal_path[k+1]] for k in range(len(optimal_path)-1))
+
+    # print(f"{breakdown['optimal_total_bpp']:.6f} bpp", breakdown['consecutive_bpp'], )
+    # print(f"{breakdown['num_transitions']:.2f} transitions  ", breakdown['saving_bpp'])
+
+    # import numpy as np
+    # np.set_printoptions(precision=3, suppress=True)
+
+
+    # # Check if big skip is really cheaper than sum of small steps
+    # sum_consecutive = sum(cost_matrix[i,i+1] for i in range(len(timesteps)-1))
+    # big_skip = cost_matrix[0, -1]
+    # # # --- KL matrix on a single batch ---
+    # # sample_batch = next(iter(eval_iter)).to(device)   # grab one batch
+
+    # # bpp_matrix, timesteps = model.compute_bpp_matrix(
+    # #     sample_batch,
+    # #     seed=seed,
+    # #     timestep_stride=1   # gives ~10 timesteps: [999, 899, ..., 99, 0]
+    # # )
+    # # print(123)
+    # # optimal_path, total_bpp, path_timesteps = find_optimal_path_dp(bpp_matrix, timesteps)
+    # # print(234)
+    # # plot_bpp_matrix(bpp_matrix, timesteps)
+    # # print("Saved BPP matrix to bpp_matrix.png")
+    # # print(f"Compress using timesteps: {path_timesteps}")
 
 
 
