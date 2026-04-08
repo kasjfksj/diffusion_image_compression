@@ -208,7 +208,7 @@ def cycle(iterable):
 class ToIntTensor:
     # for IMAGENET64
     def __call__(self, image):
-        image = torch.as_tensor(image.reshape(3, 64, 64), dtype=torch.uint8)
+        image = torch.as_tensor(image.reshape(3, 512, 512), dtype=torch.uint8)
         return image
 
 from torch.utils.data import Subset
@@ -286,7 +286,7 @@ def load_data_from_folder():
         def __init__(self, folder_path, transform=None):
             self.folder_path = Path(folder_path)
             self.transform = transforms.Compose([
-                transforms.Resize(64),
+                transforms.Resize(512),
                 transforms.CenterCrop(64),
                 transforms.ToTensor(),
                 transforms.Lambda(lambda x: (x * 255).byte()),  # convert to [0, 255] uint8
@@ -312,13 +312,11 @@ def load_data_from_folder():
         transforms.Lambda(lambda x: (x * 255).long())
     ])
     
-    full_dataset = ImageFolderFlat('data_1/', transform=transform)
+    full_dataset = ImageFolderFlat('data/', transform=transform) # This is the place to load image data
     full_dataset = torch.utils.data.Subset(full_dataset, range(100)) 
     total_size = len(full_dataset)
-    print(total_size)
     train_size = int(0.8 * total_size)
     eval_size = total_size - train_size
-    print(train_size,eval_size)
     train_data, eval_data = random_split(full_dataset, [train_size, eval_size])
     
     train_iter = DataLoader(train_data, batch_size=32, shuffle=True,
@@ -1697,9 +1695,9 @@ if __name__ == '__main__':
     torch.manual_seed(seed)
     torch.use_deterministic_algorithms(True)
 
-    model = load_checkpoint_SD(config_path='checkpoints/uqdm-small',ckpt_path="checkpoints/uqdm-sd/ckpt_0005000.pt")
+    model = load_checkpoint_SD(config_path='checkpoints/uqdm-small',ckpt_path=None)
     train_iter, eval_iter = load_data_from_folder()
-    # model.trainer(train_iter, eval_iter)
+    model.trainer(train_iter, eval_iter)
 
     bpps, psnrs = model.evaluate(eval_iter, n_batches=3, seed=seed)
     bpps = np.array(bpps)
