@@ -11,6 +11,11 @@ from diffusers import UNet2DConditionModel, DDPMScheduler
 from tensorflow_compression.python.ops import gen_ops
 import tensorflow as tf
 import matplotlib.pylab as plt
+import argparse
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+import torchvision.utils as vutils
 from itertools import islice
 from ml_collections import ConfigDict
 import numpy as np
@@ -287,7 +292,7 @@ def load_data_from_folder():
             self.folder_path = Path(folder_path)
             self.transform = transforms.Compose([
                 transforms.Resize(512),
-                transforms.CenterCrop(64),
+                transforms.CenterCrop(512),
                 transforms.ToTensor(),
                 transforms.Lambda(lambda x: (x * 255).byte()),  # convert to [0, 255] uint8
             ])
@@ -312,14 +317,14 @@ def load_data_from_folder():
         transforms.Lambda(lambda x: (x * 255).long())
     ])
     
-    full_dataset = ImageFolderFlat('data/', transform=transform) # This is the place to load image data
-    full_dataset = torch.utils.data.Subset(full_dataset, range(100)) 
+    full_dataset = ImageFolderFlat('data_1/', transform=transform) # This is the place to load image data
+    full_dataset = torch.utils.data.Subset(full_dataset, range(2)) 
     total_size = len(full_dataset)
-    train_size = int(0.8 * total_size)
+    train_size = 1
     eval_size = total_size - train_size
     train_data, eval_data = random_split(full_dataset, [train_size, eval_size])
     
-    train_iter = DataLoader(train_data, batch_size=32, shuffle=True,
+    train_iter = DataLoader(train_data, batch_size=1, shuffle=True,
                            pin_memory=True, num_workers=0)
     eval_iter = DataLoader(eval_data, batch_size=1, shuffle=False,
                           pin_memory=True, num_workers=0)
@@ -891,7 +896,7 @@ class Diffusion_SD(torch.nn.Module):
         if return_hist:
             return x_raw, samples + [x_raw]
         return x_raw
-    def forward(self, x_raw, z_1=None, recon_method=None, compress_mode=None, seed=None):
+    def forward(self, x_raw, z_1=None, recon_method=None, compress_mode=None, seed=None, eval_steps = 10):
 
         x_pixel = 2 * ((x_raw.float() + .5) / self.config.model.vocab_size) - 1
         with torch.no_grad():
@@ -965,8 +970,9 @@ class Diffusion_SD(torch.nn.Module):
             rate_s = loss_prior
             loss_diff = 0.
             metrics = []
+            sd_timesteps = torch.linspace(999, 0, eval_steps + 1, dtype=torch.long)  # eval_steps + 1 points = eval_steps steps
 
-            for i in range(total_steps):
+            for i in range(eval_steps):
                 z_t_loop = z_s
                 rate_t   = rate_s
                 ts_t = sd_timesteps[i].item()
@@ -1069,12 +1075,12 @@ class Diffusion_SD(torch.nn.Module):
         return self.compress_bits
 
     @torch.inference_mode()
-    def decompress(self, bits, image_shape, recon_method='denoise'):
+    def decompress(self, bits, image_shape, recon_method='denoise', eval_steps = 10):
         # consume the bits for each step, return the intermediate reconstructions for each step
         self.compress_bits = bits.copy()
         # consume the bits for each step
         _, metrics = self.forward(torch.zeros(image_shape, device=device), compress_mode='decode',
-                                  recon_method=recon_method, seed=0)
+                                  recon_method=recon_method, seed=0,eval_steps = eval_steps)
         return metrics['prog_x_hats']
 
     def log_probs_x_z0(self, z_0_latent, x_raw=None):
@@ -1688,74 +1694,55 @@ def plot_uqdm_analysis(cost_matrix, timesteps, psnr_per_timestep):
 
 
 if __name__ == '__main__':
-    import os
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--mode', choices=['train', 'eval'], required=True)
+    parser.add_argument('--config_path', default='checkpoints/uqdm-small')
+    parser.add_argument('--ckpt_path', default=None)
+    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--save_dir', default='reconstructions')
+    parser.add_argument('--eval_steps', type=int, default=10, help='Number of steps to evaluate for intermediate decompressed image')
+    parser.add_argument('--recon_method', choices=['ancestral', 'flow_based', 'denoise'], default='ancestral', help='Method for intermediate reconstructions during evaluation')
+    args = parser.parse_args()
+ 
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-    seed = 0
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
     torch.use_deterministic_algorithms(True)
-
-    model = load_checkpoint_SD(config_path='checkpoints/uqdm-small',ckpt_path=None)
+ 
+    model = load_checkpoint_SD(config_path=args.config_path, ckpt_path=args.ckpt_path)
     train_iter, eval_iter = load_data_from_folder()
-    model.trainer(train_iter, eval_iter)
-
-    bpps, psnrs = model.evaluate(eval_iter, n_batches=3, seed=seed)
-    bpps = np.array(bpps)
-    psnrs = np.array(psnrs)
-
-    # # --- R-D curve (your existing code) ---
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(bpps, psnrs, '-', label='UQDM', linewidth=2, color='orange')
-    ax.set_xlabel('Rate (BPP)', fontsize=13)
-    ax.set_ylabel('PSNR (dB)', fontsize=13)
-    ax.set_title('UQDM: Rate-Distortion Curve', fontsize=14)
-    ax.legend(fontsize=12, loc='lower right')
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig('uqdm_sd_rd_curve_64.png', dpi=150, bbox_inches='tight')
-    print("Saved plot to uqdm_sd_rd_curve.png")
-    # sample_batch = next(iter(train_iter)).to(device)   # grab one batch
-
-    # cost_matrix, timesteps, psnr_per_timestep = model.compute_cost_matrix_uqdm(
-    #     iter(train_iter),       # pass an iterator, not a batch
-    #     seed=seed,
-    #     timestep_stride=1,
-    #     num_images=3,         # average over 50 real images
-    #     cache_path=""
-    # )
-    # plot_uqdm_analysis(cost_matrix, timesteps, psnr_per_timestep)
-    # # check_triangle_inequality(cost_matrix)
-    # # violations_by_distance = check_additivity(cost_matrix, timesteps, max_skip=4)
-
-    # torch.set_printoptions(precision=2, sci_mode=False)
-
-    # optimal_path,  path_timesteps, breakdown = find_optimal_path_dp(cost_matrix, timesteps)
-    # raw_bpp_optimal = sum(cost_matrix[optimal_path[k], optimal_path[k+1]] for k in range(len(optimal_path)-1))
-
-    # print(f"{breakdown['optimal_total_bpp']:.6f} bpp", breakdown['consecutive_bpp'], )
-    # print(f"{breakdown['num_transitions']:.2f} transitions  ", breakdown['saving_bpp'])
-
-    # import numpy as np
-    # np.set_printoptions(precision=3, suppress=True)
-
-
-    # # Check if big skip is really cheaper than sum of small steps
-    # sum_consecutive = sum(cost_matrix[i,i+1] for i in range(len(timesteps)-1))
-    # big_skip = cost_matrix[0, -1]
-    # # # --- KL matrix on a single batch ---
-    # # sample_batch = next(iter(eval_iter)).to(device)   # grab one batch
-
-    # # bpp_matrix, timesteps = model.compute_bpp_matrix(
-    # #     sample_batch,
-    # #     seed=seed,
-    # #     timestep_stride=1   # gives ~10 timesteps: [999, 899, ..., 99, 0]
-    # # )
-    # # print(123)
-    # # optimal_path, total_bpp, path_timesteps = find_optimal_path_dp(bpp_matrix, timesteps)
-    # # print(234)
-    # # plot_bpp_matrix(bpp_matrix, timesteps)
-    # # print("Saved BPP matrix to bpp_matrix.png")
-    # # print(f"Compress using timesteps: {path_timesteps}")
-
-
-
+ 
+    if args.mode == 'train':
+        model.trainer(train_iter, eval_iter)
+ 
+    elif args.mode == 'eval':
+        image = next(iter(eval_iter))
+        print(image.shape)
+        compressed = model.compress(image)
+        bits = [len(b) * 8 for b in compressed]
+ 
+        reconstructions = model.decompress(compressed, image.shape, recon_method=args.recon_method, eval_steps=args.eval_steps)
+ 
+        bpps = np.round(np.cumsum(bits) / np.prod(image.shape) * 3, 4)
+        print('Reconstructions via: ancestral, compression to bits\nbpps:  %s' % bpps)
+ 
+        os.makedirs(args.save_dir, exist_ok=True)
+        img_original = image.squeeze().cpu().float().div(255).clamp(0, 1)
+        reconstructions = reconstructions.cpu() / 255.0
+ 
+        indices = np.linspace(0, len(reconstructions) - 1, 10, dtype=int)
+        selected = [reconstructions[i].squeeze().clamp(0, 1) for i in indices]
+ 
+        all_images = torch.stack([img_original] + selected, dim=0)
+        grid = vutils.make_grid(all_images, nrow=11, padding=4, pad_value=1.0)
+        plt.imsave(os.path.join(args.save_dir, 'comparison_grid.png'), grid.permute(1, 2, 0).numpy())
+        print(f'Saved comparison grid to {args.save_dir}/comparison_grid.png')
+ 
+        cost_matrix, timesteps, psnr_per_timestep = model.compute_cost_matrix_uqdm(
+            iter(train_iter), seed=args.seed, timestep_stride=1, num_images=3, cache_path=""
+        )
+        plot_uqdm_analysis(cost_matrix, timesteps, psnr_per_timestep)
+ 
+        optimal_path, path_timesteps, breakdown = find_optimal_path_dp(cost_matrix, timesteps)
+        print(f"{breakdown['optimal_total_bpp']:.6f} bpp", breakdown['consecutive_bpp'])
+        print(f"{breakdown['num_transitions']:.2f} transitions  ", breakdown['saving_bpp'])
