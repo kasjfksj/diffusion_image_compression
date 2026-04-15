@@ -60,6 +60,16 @@ For testing the performance of SD 1.5 compared to pretrained model, run the comm
 python3 test.py
 ```
 
+For testing the performance of SD 1.5 compared to pretrained model, run the command
+```bash
+python3 uqdm_sd.py --mode train
+```
+
+For evaluating UQDM both visually and qualitatively, run the command
+```bash
+python uqdm_sd.py --mode eval --save_dir outputs --ckpt_path "the path to scale head model"
+```
+
 ## Citation
 
 ```bibtex
