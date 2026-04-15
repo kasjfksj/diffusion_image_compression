@@ -1,0 +1,18 @@
+{"time":"2026-04-09T15:38:21.584742996-07:00","level":"INFO","msg":"stream: starting","core version":"0.22.0"}
+{"time":"2026-04-09T15:38:21.841556965-07:00","level":"INFO","msg":"stream: created new stream","id":"k3wcrr8i"}
+{"time":"2026-04-09T15:38:21.841607621-07:00","level":"INFO","msg":"stream: started","id":"k3wcrr8i"}
+{"time":"2026-04-09T15:38:21.841689385-07:00","level":"INFO","msg":"writer: started","stream_id":"k3wcrr8i"}
+{"time":"2026-04-09T15:38:21.84178118-07:00","level":"INFO","msg":"handler: started","stream_id":"k3wcrr8i"}
+{"time":"2026-04-09T15:38:21.841807357-07:00","level":"INFO","msg":"sender: started","stream_id":"k3wcrr8i"}
+{"time":"2026-04-10T10:24:28.031401123-07:00","level":"INFO","msg":"api: retrying HTTP error","status":500,"url":"https://api.wandb.ai/files/jukamala/uqdm-stable-diffusion/k3wcrr8i/file_stream","body":"{\"error\":\"context deadline exceeded\"}"}
+{"time":"2026-04-10T12:36:53.560134686-07:00","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/graphql\": context deadline exceeded"}
+{"time":"2026-04-13T12:31:41.518288214-07:00","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/graphql\": context deadline exceeded"}
+{"time":"2026-04-13T14:26:53.239999544-07:00","level":"INFO","msg":"api: retrying HTTP error","status":502,"url":"https://api.wandb.ai/files/jukamala/uqdm-stable-diffusion/k3wcrr8i/file_stream","body":"\n<html><head>\n<meta http-equiv=\"content-type\" content=\"text/html;charset=utf-8\">\n<title>502 Server Error</title>\n</head>\n<body text=#000000 bgcolor=#ffffff>\n<h1>Error: Server Error</h1>\n<h2>The server encountered a temporary error and could not complete your request.<p>Please try again in 30 seconds.</h2>\n<h2></h2>\n</body></html>\n"}
+{"time":"2026-04-13T14:26:56.603863723-07:00","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/graphql\": net/http: request canceled (Client.Timeout exceeded while awaiting headers)"}
+{"time":"2026-04-15T02:02:11.52089762-07:00","level":"INFO","msg":"api: retrying HTTP error","status":502,"url":"https://api.wandb.ai/files/jukamala/uqdm-stable-diffusion/k3wcrr8i/file_stream","body":"\n<html><head>\n<meta http-equiv=\"content-type\" content=\"text/html;charset=utf-8\">\n<title>502 Server Error</title>\n</head>\n<body text=#000000 bgcolor=#ffffff>\n<h1>Error: Server Error</h1>\n<h2>The server encountered a temporary error and could not complete your request.<p>Please try again in 30 seconds.</h2>\n<h2></h2>\n</body></html>\n"}
+{"time":"2026-04-15T12:25:43.501037365-07:00","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/graphql\": net/http: request canceled (Client.Timeout exceeded while awaiting headers)"}
+{"time":"2026-04-15T13:18:19.124342817-07:00","level":"INFO","msg":"stream: closing","id":"k3wcrr8i"}
+{"time":"2026-04-15T13:18:19.518420648-07:00","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2026-04-15T13:18:19.828956853-07:00","level":"INFO","msg":"handler: closed","stream_id":"k3wcrr8i"}
+{"time":"2026-04-15T13:18:19.830826786-07:00","level":"INFO","msg":"sender: closed","stream_id":"k3wcrr8i"}
+{"time":"2026-04-15T13:18:19.830842563-07:00","level":"INFO","msg":"stream: closed","id":"k3wcrr8i"}

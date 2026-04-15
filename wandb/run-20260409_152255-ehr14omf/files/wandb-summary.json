@@ -1,0 +1,1 @@
+{"train/lr":5.9800000000000003e-05,"_step":300,"train/bpd":13.575053215026855,"_runtime":611.906957707,"_timestamp":1.7757738571274629e+09,"train/bpd_recon":8.603960037231445,"train/bpd_diff":0.37931740283966064,"train/bpd_latent":4.591775417327881,"_wandb":{"runtime":611}}

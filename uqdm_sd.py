@@ -1,15 +1,14 @@
-from networkx import config
 import torch
 import torch.nn as nn
+import wandb
 from torch.utils.data import Dataset, DataLoader, default_collate
 from torch.distributions import constraints, TransformedDistribution, SigmoidTransform, AffineTransform
 from torch.distributions import Normal, Uniform
 from torch.distributions.kl import kl_divergence
-from safetensors.torch import load_file
 from diffusers import UNet2DConditionModel, DDPMScheduler
 # For compression to bits only
-from tensorflow_compression.python.ops import gen_ops
-import tensorflow as tf
+# from tensorflow_compression.python.ops import gen_ops
+# import tensorflow as tf
 import matplotlib.pylab as plt
 from itertools import islice
 from ml_collections import ConfigDict
@@ -277,53 +276,47 @@ from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import transforms
 from PIL import Image
 from torch.utils.data import Subset
-def load_data_from_folder():
+def load_data_from_folder(folder_path='data/', batch_size=4, eval_split=0.02):
     """
-    Load images from data/ folder and split into train (90%) and eval (10%) sets
-    Returns infinitely looping training iterator and finite eval iterator
+    Load images from a folder (including subdirectories) and split into train/eval sets.
+    Designed for full-resolution ImageNet: resizes/crops to 512x512.
+    Returns infinitely looping training iterator and finite eval iterator.
     """
-    class ImageFolderFlat(Dataset):
-        def __init__(self, folder_path, transform=None):
+    class ImageFolderRecursive(Dataset):
+        def __init__(self, folder_path):
             self.folder_path = Path(folder_path)
             self.transform = transforms.Compose([
                 transforms.Resize(512),
-                transforms.CenterCrop(64),
+                transforms.CenterCrop(512),
                 transforms.ToTensor(),
-                transforms.Lambda(lambda x: (x * 255).byte()),  # convert to [0, 255] uint8
+                transforms.Lambda(lambda x: (x * 255).byte()),  # [0, 255] uint8
             ])
-            self.image_paths = list(self.folder_path.glob('*.jpg')) + \
-                              list(self.folder_path.glob('*.png')) + \
-                              list(self.folder_path.glob('*.jpeg')) +\
-                              list(self.folder_path.glob('*.JPEG'))
-            
+            exts = ['*.jpg', '*.jpeg', '*.png', '*.JPEG', '*.JPG', '*.PNG']
+            self.image_paths = []
+            print(f'Scanning {folder_path} for images...')
+            for ext in tqdm(exts, desc='Scanning extensions'):
+                self.image_paths.extend(self.folder_path.rglob(ext))
+            print(f'Found {len(self.image_paths):,} images.')
+
         def __len__(self):
             return len(self.image_paths)
-        
-        def __getitem__(self, idx):
 
+        def __getitem__(self, idx):
             img_path = self.image_paths[idx]
             image = Image.open(img_path).convert('RGB')
-            if self.transform:
-                image = self.transform(image)
-            return image
-    
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Lambda(lambda x: (x * 255).long())
-    ])
-    
-    full_dataset = ImageFolderFlat('data/', transform=transform) # This is the place to load image data
-    full_dataset = torch.utils.data.Subset(full_dataset, range(100)) 
+            return self.transform(image)
+
+    full_dataset = ImageFolderRecursive(folder_path)
     total_size = len(full_dataset)
-    train_size = int(0.8 * total_size)
-    eval_size = total_size - train_size
+    eval_size = max(1, int(eval_split * total_size))
+    train_size = total_size - eval_size
     train_data, eval_data = random_split(full_dataset, [train_size, eval_size])
-    
-    train_iter = DataLoader(train_data, batch_size=32, shuffle=True,
-                           pin_memory=True, num_workers=0)
+
+    train_iter = DataLoader(train_data, batch_size=batch_size, shuffle=True,
+                            pin_memory=True, num_workers=0)
     eval_iter = DataLoader(eval_data, batch_size=1, shuffle=False,
-                          pin_memory=True, num_workers=0)
-    
+                           pin_memory=True, num_workers=0)
+
     train_iter = cycle(train_iter)
 
     return train_iter, eval_iter
@@ -1230,6 +1223,10 @@ class Diffusion_SD(torch.nn.Module):
         if self.step >= self.config.training.n_steps:
             print('Skipping training, increase training.n_steps if more steps are desired.')
 
+        wandb.init(project='uqdm-stable-diffusion', config=self.config.to_dict(),
+                   resume='allow')
+
+        pbar = tqdm(initial=self.step, total=self.config.training.n_steps, desc='Training')
         while self.step < self.config.training.n_steps:
 
             # ── Parameter update ──────────────────────────────────────────────────
@@ -1248,16 +1245,27 @@ class Diffusion_SD(torch.nn.Module):
                     trainable_params, max_norm=self.config.optim.grad_clip_norm
                 )
             self.optimizer.step()
-            
+
             self.step += 1
             self.ema.update(trainable_params)
-            
+            pbar.update(1)
+
             last = self.step == self.config.training.n_steps
+
+            # ── Train metrics ─────────────────────────────────────────────────────
             if self.step % self.config.training.log_metrics_every_steps == 0 or last:
+                train_log = {f'train/{k}': v.mean().item() for k, v in metrics.items()}
+                train_log['train/lr'] = self.optimizer.param_groups[0]['lr']
+                wandb.log(train_log, step=self.step)
+                pbar.set_postfix({k.split('/')[-1]: f'{v:.4f}' for k, v in train_log.items()})
+
+            # ── Checkpoint ────────────────────────────────────────────────────────
+            if self.step % self.config.training.checkpoint_every_steps == 0 or last:
                 self.save()
-                print(metrics)
-            # ── Checkpoint + train metrics ────────────────────────────────────────
-            
+                # Keep only the last 3 checkpoints
+                ckpts = sorted(Path(CHECKPOINT_DIR).glob('ckpt_*.pt'))
+                for old in ckpts[:-3]:
+                    old.unlink()
 
             # ── Validation metrics ────────────────────────────────────────────────
             if eval_iter is not None and (
@@ -1269,6 +1277,7 @@ class Diffusion_SD(torch.nn.Module):
                     islice(eval_iter, n_batches),
                     total=n_batches or len(eval_iter),
                     desc='Evaluating on test set',
+                    leave=False,
                 ):
                     batch = batch.to(device)
                     with torch.inference_mode():
@@ -1279,7 +1288,10 @@ class Diffusion_SD(torch.nn.Module):
                         self.ema.restore(trainable_params)
                     res += [ths_metrics]
                 res = default_collate(res)
-                print({k: v.mean().item() for k, v in res.items()})
+                eval_log = {f'eval/{k}': v.mean().item() for k, v in res.items()}
+                print(eval_log)
+                wandb.log(eval_log, step=self.step)
+        pbar.close()
     @staticmethod
     def mse_to_psnr(mse, max_val):
         with np.errstate(divide='ignore'):
@@ -1696,7 +1708,7 @@ if __name__ == '__main__':
     torch.use_deterministic_algorithms(True)
 
     model = load_checkpoint_SD(config_path='checkpoints/uqdm-small',ckpt_path=None)
-    train_iter, eval_iter = load_data_from_folder()
+    train_iter, eval_iter = load_data_from_folder(folder_path='/extra/ucibdl1/shared/data/imagenet/train')
     model.trainer(train_iter, eval_iter)
 
     bpps, psnrs = model.evaluate(eval_iter, n_batches=3, seed=seed)

@@ -22,7 +22,7 @@
   },
   "training": {
     "n_steps": 500000,
-    "log_metrics_every_steps": 1000,
+    "log_metrics_every_steps": 10,
     "checkpoint_every_steps": 10000,
     "eval_every_steps": 10000,
     "eval_steps_to_run": 50

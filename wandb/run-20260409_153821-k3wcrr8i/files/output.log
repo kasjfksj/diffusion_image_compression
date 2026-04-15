@@ -1,0 +1,99 @@
+Training:  32%|▎| 160000/500000 [96:53:27<168:13:30,  1.78s/it, bpd=12.4077, bpd_latent=4.5110, bpd_recon=7.8597, bpd_di
+Saved checkpoint → checkpoints/uqdm-sd/ckpt_0010000.pt
+                                                                                                                        
+{'eval/bpd': 41.235107421875, 'eval/bpd_latent': 0.0, 'eval/bpd_recon': 9.050101280212402, 'eval/bpd_diff': 32.18500900268555}
+Saved checkpoint → checkpoints/uqdm-sd/ckpt_0020000.pt
+{'eval/bpd': 2896.17138671875, 'eval/bpd_latent': 0.0, 'eval/bpd_recon': 9.047465324401855, 'eval/bpd_diff': 2887.1240234375}
+Saved checkpoint → checkpoints/uqdm-sd/ckpt_0030000.pt
+{'eval/bpd': 50784.25390625, 'eval/bpd_latent': 0.0, 'eval/bpd_recon': 9.046553611755371, 'eval/bpd_diff': 50775.203125}
+Saved checkpoint → checkpoints/uqdm-sd/ckpt_0040000.pt
+{'eval/bpd': 149.61703491210938, 'eval/bpd_latent': 0.0, 'eval/bpd_recon': 9.05029296875, 'eval/bpd_diff': 140.56674194335938}
+Saved checkpoint → checkpoints/uqdm-sd/ckpt_0050000.pt
+{'eval/bpd': 62.09227752685547, 'eval/bpd_latent': 0.0, 'eval/bpd_recon': 9.047060012817383, 'eval/bpd_diff': 53.04521179199219}
+Saved checkpoint → checkpoints/uqdm-sd/ckpt_0060000.pt
+{'eval/bpd': 369.52978515625, 'eval/bpd_latent': 0.0, 'eval/bpd_recon': 9.046599388122559, 'eval/bpd_diff': 360.4831848144531}
+Saved checkpoint → checkpoints/uqdm-sd/ckpt_0070000.pt
+{'eval/bpd': 194.0475311279297, 'eval/bpd_latent': 0.0, 'eval/bpd_recon': 9.0455904006958, 'eval/bpd_diff': 185.0019073486328}
+Saved checkpoint → checkpoints/uqdm-sd/ckpt_0080000.pt
+{'eval/bpd': 8597.11328125, 'eval/bpd_latent': 0.0, 'eval/bpd_recon': 9.039846420288086, 'eval/bpd_diff': 8588.07421875}
+Saved checkpoint → checkpoints/uqdm-sd/ckpt_0090000.pt
+{'eval/bpd': 134.03546142578125, 'eval/bpd_latent': 0.0, 'eval/bpd_recon': 9.041915893554688, 'eval/bpd_diff': 124.99354553222656}
+Saved checkpoint → checkpoints/uqdm-sd/ckpt_0100000.pt
+{'eval/bpd': 158.7289276123047, 'eval/bpd_latent': 0.0, 'eval/bpd_recon': 9.049673080444336, 'eval/bpd_diff': 149.67926025390625}
+Saved checkpoint → checkpoints/uqdm-sd/ckpt_0110000.pt
+{'eval/bpd': 6848.44189453125, 'eval/bpd_latent': 0.0, 'eval/bpd_recon': 9.045220375061035, 'eval/bpd_diff': 6839.39501953125}
+Saved checkpoint → checkpoints/uqdm-sd/ckpt_0120000.pt
+{'eval/bpd': 3444.973876953125, 'eval/bpd_latent': 0.0, 'eval/bpd_recon': 9.043158531188965, 'eval/bpd_diff': 3435.930908203125}
+Saved checkpoint → checkpoints/uqdm-sd/ckpt_0130000.pt
+{'eval/bpd': 75.9990005493164, 'eval/bpd_latent': 0.0, 'eval/bpd_recon': 9.044407844543457, 'eval/bpd_diff': 66.95458984375}
+Saved checkpoint → checkpoints/uqdm-sd/ckpt_0140000.pt
+{'eval/bpd': 64.98361206054688, 'eval/bpd_latent': 0.0, 'eval/bpd_recon': 9.052478790283203, 'eval/bpd_diff': 55.93113327026367}
+Saved checkpoint → checkpoints/uqdm-sd/ckpt_0150000.pt
+{'eval/bpd': 1666.844970703125, 'eval/bpd_latent': 0.0, 'eval/bpd_recon': 9.041807174682617, 'eval/bpd_diff': 1657.8033447265625}
+Saved checkpoint → checkpoints/uqdm-sd/ckpt_0160000.pt
+{'eval/bpd': 1801.7049560546875, 'eval/bpd_latent': 0.0, 'eval/bpd_recon': 9.042423248291016, 'eval/bpd_diff': 1792.6624755859375}
+Saved checkpoint → checkpoints/uqdm-sd/ckpt_0170000.pt
+{'eval/bpd': 56.47975540161133, 'eval/bpd_latent': 0.0, 'eval/bpd_recon': 9.044513702392578, 'eval/bpd_diff': 47.43524169921875}
+Saved checkpoint → checkpoints/uqdm-sd/ckpt_0180000.pt
+{'eval/bpd': 4226.892578125, 'eval/bpd_latent': 0.0, 'eval/bpd_recon': 9.048418998718262, 'eval/bpd_diff': 4217.84423828125}
+Saved checkpoint → checkpoints/uqdm-sd/ckpt_0190000.pt
+{'eval/bpd': 289.81005859375, 'eval/bpd_latent': 0.0, 'eval/bpd_recon': 9.046361923217773, 'eval/bpd_diff': 280.7637023925781}
+Saved checkpoint → checkpoints/uqdm-sd/ckpt_0200000.pt
+{'eval/bpd': 222.62615966796875, 'eval/bpd_latent': 0.0, 'eval/bpd_recon': 9.046902656555176, 'eval/bpd_diff': 213.57928466796875}
+Saved checkpoint → checkpoints/uqdm-sd/ckpt_0210000.pt
+{'eval/bpd': 2997.498779296875, 'eval/bpd_latent': 0.0, 'eval/bpd_recon': 9.047243118286133, 'eval/bpd_diff': 2988.451416015625}
+Saved checkpoint → checkpoints/uqdm-sd/ckpt_0220000.pt
+{'eval/bpd': 59.173866271972656, 'eval/bpd_latent': 0.0, 'eval/bpd_recon': 9.051681518554688, 'eval/bpd_diff': 50.1221809387207}
+Saved checkpoint → checkpoints/uqdm-sd/ckpt_0230000.pt
+    model.trainer(train_iter, eval_iter)
+  File "/home/jcwill/PycharmProjects/diffusion_image_compression/uqdm_sd.py", line 1287, in trainer
+    _, ths_metrics = self(batch)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/jcwill/PycharmProjects/diffusion_image_compression/uqdm_sd.py", line 969, in forward
+    z_s, rate_s = self.transmit_q_s_t(
+  File "/home/jcwill/PycharmProjects/diffusion_image_compression/uqdm_sd.py", line 819, in transmit_q_s_t
+    p_loc, p_scale = self.get_s_t_params(z_t, t, s, cache_denoised=cache_denoised, x_raw_debug=x_raw)
+  File "/home/jcwill/PycharmProjects/diffusion_image_compression/uqdm_sd.py", line 772, in get_s_t_params
+    eps_hat, pred_scale_factors = self.score_net(z_t, gamma_t)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/jcwill/PycharmProjects/diffusion_image_compression/uqdm_sd.py", line 93, in forward
+    eps_hat = self.unet(z, timesteps, encoder_hidden_states=null_cond).sample
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/diffusers/models/unets/unet_2d_condition.py", line 1281, in forward
+    sample = upsample_block(
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/diffusers/models/unets/unet_2d_blocks.py", line 2551, in forward
+    hidden_states = attn(
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/diffusers/models/transformers/transformer_2d.py", line 442, in forward
+    hidden_states = block(
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/diffusers/models/attention.py", line 491, in forward
+    norm_hidden_states = self.norm2(hidden_states)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/normalization.py", line 202, in forward
+    return F.layer_norm(
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/functional.py", line 2576, in layer_norm
+    return torch.layer_norm(input, normalized_shape, weight, bias, eps, torch.backends.cudnn.enabled)
+KeyboardInterrupt

@@ -1,0 +1,166 @@
+_wandb:
+    value:
+        cli_version: 0.22.0
+        e:
+            5rrfrjk5xot29n5c60gqsuebtl6k4yhu:
+                codePath: uqdm_sd.py
+                codePathLocal: uqdm_sd.py
+                cpu_count: 32
+                cpu_count_logical: 64
+                cudaVersion: "11.8"
+                disk:
+                    /:
+                        total: "105089261568"
+                        used: "65573605376"
+                email: justuswill@gmail.com
+                executable: /home/jcwill/miniconda/envs/UQDM-local/bin/python
+                git:
+                    commit: ddfb755f5e02e4875c6cd950e6904b23149e16ee
+                    remote: https://github.com/kasjfksj/diffusion_image_compression.git
+                gpu: NVIDIA TITAN RTX
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Turing
+                      cudaCores: 4608
+                      memoryTotal: "25769803776"
+                      name: NVIDIA TITAN RTX
+                      uuid: GPU-2a638e68-d3f9-05de-6ed9-c019520189db
+                host: ava-m0.ics.uci.edu
+                memory:
+                    total: "540661075968"
+                os: Linux-5.4.0-172-generic-x86_64-with-glibc2.31
+                program: /home/jcwill/PycharmProjects/diffusion_image_compression/uqdm_sd.py
+                python: CPython 3.10.13
+                root: /home/jcwill/PycharmProjects/diffusion_image_compression
+                slurm:
+                    cluster_name: ics.c
+                    conf: /etc/slurm/slurm.conf
+                    cpus_on_node: "20"
+                    cpus_per_task: "20"
+                    distribution: cyclic
+                    gpus_on_node: "1"
+                    gtids: "0"
+                    job_account: grad.a
+                    job_cpus_per_node: "20"
+                    job_gid: "1002"
+                    job_id: "561430"
+                    job_name: bash
+                    job_nodelist: ava-m0
+                    job_num_nodes: "1"
+                    job_partition: ava_m.p
+                    job_qos: normal
+                    job_uid: "20015"
+                    job_user: jcwill
+                    jobid: "561430"
+                    launch_node_ipaddr: 128.195.10.162
+                    localid: "0"
+                    nnodes: "1"
+                    nodeid: "0"
+                    nodelist: ava-m0
+                    nprocs: "1"
+                    ntasks: "1"
+                    prio_process: "0"
+                    procid: "0"
+                    pty_port: "33721"
+                    pty_win_col: "120"
+                    pty_win_row: "29"
+                    srun_comm_host: 128.195.10.162
+                    srun_comm_port: "34111"
+                    step_gpus: "4"
+                    step_id: "0"
+                    step_launcher_port: "34111"
+                    step_nodelist: ava-m0
+                    step_num_nodes: "1"
+                    step_num_tasks: "1"
+                    step_tasks_per_node: "1"
+                    stepid: "0"
+                    submit_dir: /home/jcwill
+                    submit_host: ava-m2.ics.uci.edu
+                    task_pid: "240755"
+                    tasks_per_node: "1"
+                    topology_addr: ava-m0
+                    topology_addr_pattern: node
+                    umask: "0077"
+                    working_cluster: ics.c:128.195.6.96:7002:9472:109
+                startedAt: "2026-04-09T22:12:53.762249Z"
+                writerId: 5rrfrjk5xot29n5c60gqsuebtl6k4yhu
+        m: []
+        python_version: 3.10.13
+        t:
+            "1":
+                - 1
+                - 5
+                - 11
+                - 12
+                - 41
+                - 45
+                - 49
+                - 53
+                - 71
+                - 83
+                - 98
+                - 105
+            "2":
+                - 1
+                - 5
+                - 11
+                - 12
+                - 41
+                - 45
+                - 49
+                - 53
+                - 71
+                - 83
+                - 98
+                - 105
+            "3":
+                - 16
+            "4": 3.10.13
+            "5": 0.22.0
+            "6": 4.57.6
+            "12": 0.22.0
+            "13": linux-x86_64
+data:
+    value:
+        batch_size: 2
+        data_spec: imagenet
+        num_workers: 1
+        pin_memory: true
+        shuffle: false
+model:
+    value:
+        attention_everywhere: false
+        base_prior_scale: forward_kernel
+        dropout_prob: 0
+        ema_rate: 0.9999
+        embedding_dim: 64
+        fix_gamma_max: true
+        gamma_max: 6
+        gamma_min: -12.3
+        learned_prior_scale: true
+        n_attention_heads: 1
+        n_blocks: 8
+        n_channels: 3
+        n_timesteps: 4
+        noise_schedule: learned_linear
+        norm_groups: 16
+        prior_type: logistic
+        use_fourier_features: true
+        vocab_size: 256
+optim:
+    value:
+        beta1: 0.9
+        eps: 1e-08
+        grad_clip_norm: 1
+        lr: 0.0002
+        warmup: 1000
+        weight_decay: 0
+restore_ckpt:
+    value: checkpoint.pt
+training:
+    value:
+        checkpoint_every_steps: 10000
+        eval_every_steps: 10000
+        eval_steps_to_run: 50
+        log_metrics_every_steps: 1000
+        n_steps: 500000

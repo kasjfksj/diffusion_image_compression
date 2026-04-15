@@ -1,0 +1,42 @@
+Training:   0%|                                                                | 268/500000 [07:38<225:35:29,  1.63s/it]Traceback (most recent call last):
+  File "/home/jcwill/PycharmProjects/diffusion_image_compression/uqdm_sd.py", line 1712, in <module>
+    model.trainer(train_iter, eval_iter)
+  File "/home/jcwill/PycharmProjects/diffusion_image_compression/uqdm_sd.py", line 1236, in trainer
+    loss, metrics = self(batch)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/jcwill/PycharmProjects/diffusion_image_compression/uqdm_sd.py", line 891, in forward
+    x_latent = self.vae.encode(x_pixel).latent_dist.sample() * self.vae_scale_factor
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/diffusers/utils/accelerate_utils.py", line 46, in wrapper
+    return method(self, *args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/diffusers/models/autoencoders/autoencoder_kl.py", line 271, in encode
+    h = self.encoder(x)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/diffusers/models/autoencoders/vae.py", line 172, in forward
+    sample = down_block(sample)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/diffusers/models/unets/unet_2d_blocks.py", line 1474, in forward
+    hidden_states = resnet(hidden_states, temb=None)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/diffusers/models/resnet.py", line 366, in forward
+    hidden_states = self.conv2(hidden_states)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/conv.py", line 458, in forward
+    return self._conv_forward(input, self.weight, self.bias)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/conv.py", line 454, in _conv_forward
+    return F.conv2d(input, weight, bias, self.stride,
+KeyboardInterrupt

@@ -1,0 +1,54 @@
+Training:   0%| | 377/500000 [10:09<250:28:28,  1.80s/it, bpd=13.5751, bpd_latent=4.5918, bpd_recon=8.6040, bpd_diff=0.3Traceback (most recent call last):
+  File "/home/jcwill/PycharmProjects/diffusion_image_compression/uqdm_sd.py", line 1712, in <module>
+    model.trainer(train_iter, eval_iter)
+  File "/home/jcwill/PycharmProjects/diffusion_image_compression/uqdm_sd.py", line 1236, in trainer
+    loss, metrics = self(batch)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/jcwill/PycharmProjects/diffusion_image_compression/uqdm_sd.py", line 935, in forward
+    p_loc, p_scale = self.get_s_t_params(
+  File "/home/jcwill/PycharmProjects/diffusion_image_compression/uqdm_sd.py", line 772, in get_s_t_params
+    eps_hat, pred_scale_factors = self.score_net(z_t, gamma_t)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/jcwill/PycharmProjects/diffusion_image_compression/uqdm_sd.py", line 93, in forward
+    eps_hat = self.unet(z, timesteps, encoder_hidden_states=null_cond).sample
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/diffusers/models/unets/unet_2d_condition.py", line 1281, in forward
+    sample = upsample_block(
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/diffusers/models/unets/unet_2d_blocks.py", line 2551, in forward
+    hidden_states = attn(
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/diffusers/models/transformers/transformer_2d.py", line 442, in forward
+    hidden_states = block(
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/diffusers/models/attention.py", line 466, in forward
+    attn_output = self.attn1(
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/diffusers/models/attention_processor.py", line 490, in forward
+    return self.processor(
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/diffusers/models/attention_processor.py", line 2340, in __call__
+    key = attn.to_k(encoder_hidden_states)
+  File "/home/jcwill/miniconda/envs/UQDM-local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1716, in __getattr__
+    def __getattr__(self, name: str) -> Any:
+KeyboardInterrupt
