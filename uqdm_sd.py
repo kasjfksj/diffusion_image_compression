@@ -8,6 +8,8 @@ from torch.distributions.kl import kl_divergence
 from safetensors.torch import load_file
 from diffusers import UNet2DConditionModel, DDPMScheduler
 # For compression to bits only
+from torchvision.utils import save_image
+
 from tensorflow_compression.python.ops import gen_ops
 import tensorflow as tf
 import matplotlib.pylab as plt
@@ -54,31 +56,15 @@ class SD15ScoreNet(torch.nn.Module):
             subfolder="scheduler"
         )
 
-        # Scale head takes the penultimate UNet latent (320 channels from conv_in path)
-        # SD1.5 UNet final conv_out goes from 320 -> 4, so we hook before it
-        penultimate_channels = self.unet.conv_out.in_channels  # typically 320
-        self.scale_head = nn.Sequential(
-            nn.Conv2d(penultimate_channels, 64, kernel_size=1),
-            nn.SiLU(),
-            nn.Conv2d(64, 4, kernel_size=1),
-        ).cuda()
+        # Precompute analytic posterior variance from scheduler buffers.
+        # tilde_beta_t = (1 - alpha_bar_{t-1}) / (1 - alpha_bar_t) * beta_t
+        # For t=0 we clamp to beta_0 (no previous step exists).
+        alphas_cumprod = self.sd_scheduler.alphas_cumprod
+        alphas_cumprod_prev = torch.cat([torch.tensor([1.0]), alphas_cumprod[:-1]])
+        betas = 1.0 - alphas_cumprod / alphas_cumprod_prev
+        self.register_buffer("analytic_scale", betas.sqrt()) 
 
-        # # Zero-init the last layer for stable training start
-        nn.init.kaiming_normal_(self.scale_head[0].weight, mode='fan_out', nonlinearity='relu')
-        nn.init.zeros_(self.scale_head[0].bias)
-        nn.init.xavier_normal_(self.scale_head[-1].weight, gain=0.01)  # small but non-zero
-        nn.init.zeros_(self.scale_head[-1].bias)
-
-        self._penultimate_latent = None
-        self._register_penultimate_hook()
-
-    def _register_penultimate_hook(self):
-        """Hook the layer immediately before conv_out to capture its output."""
-        def hook_fn(module, input, output):
-            # input[0] is the tensor fed into conv_out — the penultimate latent
-            self._penultimate_latent = input[0]
-
-        self.unet.conv_out.register_forward_hook(hook_fn)
+    # scale_head, _register_penultimate_hook, and the hook itself are all removed.
 
     def softplus_init1(self, x):
         return torch.nn.functional.softplus(x + self.SOFTPLUS_INV1)
@@ -89,20 +75,22 @@ class SD15ScoreNet(torch.nn.Module):
         alpha2_target = torch.sigmoid(-g_t)
         alphas_cumprod = self.sd_scheduler.alphas_cumprod.to(z.device)
         diffs = (alphas_cumprod.unsqueeze(0) - alpha2_target.unsqueeze(1)).abs()
-        timesteps = diffs.argmin(dim=1).long()
+        timesteps = diffs.argmin(dim=1).long()                      # [B]
 
         null_cond = torch.zeros(z.shape[0], 77, 768, device=z.device, dtype=z.dtype)
 
-        # UNet forward — no grad for the UNet weights, but hook captures the
-        # penultimate latent so scale_head can still receive gradients through it
         with torch.no_grad():
             eps_hat = self.unet(z, timesteps, encoder_hidden_states=null_cond).sample
 
-        # _penultimate_latent was captured inside the no_grad block, so we must
-        # re-enable grad for the scale_head branch
-        penultimate = self._penultimate_latent
+        # Look up the analytic posterior variance for each sample's timestep.
+        # Expand to [B, 1, 1, 1] so it broadcasts over the spatial latent dims.
+        # var = self.posterior_variance[timesteps].to(z.dtype)        # [B]
+        # var = var[:, None, None, None]                              # [B, 1, 1, 1]
 
-        pred_scale_factors = self.softplus_init1(self.scale_head(penultimate))
+        # Broadcast to match the latent spatial shape [B, 4, H, W]
+        scale = self.analytic_scale[timesteps].to(z.dtype)
+        pred_scale_factors = scale[:, None, None, None].expand_as(eps_hat)
+
         return eps_hat, pred_scale_factors
 class ExponentialMovingAverage:
     """
@@ -211,9 +199,14 @@ def cycle(iterable):
 
 
 class ToIntTensor:
-    # for IMAGENET64
+    def __init__(self, resolution=64):
+        self.resolution = resolution
+
     def __call__(self, image):
-        image = torch.as_tensor(image.reshape(3, 512, 512), dtype=torch.uint8)
+        image = torch.as_tensor(
+            image.reshape(3, self.resolution, self.resolution),
+            dtype=torch.uint8
+        )
         return image
 
 from torch.utils.data import Subset
@@ -282,53 +275,50 @@ from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import transforms
 from PIL import Image
 from torch.utils.data import Subset
-def load_data_from_folder():
+def load_data_from_folder(folder_path='data_1/', resolution=512):
     """
-    Load images from data/ folder and split into train (90%) and eval (10%) sets
-    Returns infinitely looping training iterator and finite eval iterator
+    Load images from a folder and split into train (90%) and eval (10%) sets.
+    Returns infinitely looping training iterator and finite eval iterator.
     """
     class ImageFolderFlat(Dataset):
-        def __init__(self, folder_path, transform=None):
+        def __init__(self, folder_path):
             self.folder_path = Path(folder_path)
             self.transform = transforms.Compose([
-                transforms.Resize(512),
-                transforms.CenterCrop(512),
+                transforms.Resize(resolution),
+                transforms.CenterCrop(resolution),
                 transforms.ToTensor(),
                 transforms.Lambda(lambda x: (x * 255).byte()),  # convert to [0, 255] uint8
             ])
-            self.image_paths = list(self.folder_path.glob('*.jpg')) + \
-                              list(self.folder_path.glob('*.png')) + \
-                              list(self.folder_path.glob('*.jpeg')) +\
-                              list(self.folder_path.glob('*.JPEG'))
-            
+            self.image_paths = (
+                list(self.folder_path.glob('*.jpg')) +
+                list(self.folder_path.glob('*.png')) +
+                list(self.folder_path.glob('*.jpeg')) +
+                list(self.folder_path.glob('*.JPEG'))
+            )
+
         def __len__(self):
             return len(self.image_paths)
-        
-        def __getitem__(self, idx):
 
+        def __getitem__(self, idx):
             img_path = self.image_paths[idx]
             image = Image.open(img_path).convert('RGB')
             if self.transform:
                 image = self.transform(image)
             return image
-    
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Lambda(lambda x: (x * 255).long())
-    ])
-    
-    full_dataset = ImageFolderFlat('data_1/', transform=transform) # This is the place to load image data
-    full_dataset = torch.utils.data.Subset(full_dataset, range(2)) 
+
+    full_dataset = ImageFolderFlat(folder_path)
+    # full_dataset = torch.utils.data.Subset(full_dataset, range(10))
+
     total_size = len(full_dataset)
-    train_size = 1
+    train_size = len(full_dataset) -2000
     eval_size = total_size - train_size
     train_data, eval_data = random_split(full_dataset, [train_size, eval_size])
-    
+
     train_iter = DataLoader(train_data, batch_size=1, shuffle=True,
-                           pin_memory=True, num_workers=0)
+                            pin_memory=True, num_workers=0)
     eval_iter = DataLoader(eval_data, batch_size=1, shuffle=False,
-                          pin_memory=True, num_workers=0)
-    
+                           pin_memory=True, num_workers=0)
+
     train_iter = cycle(train_iter)
 
     return train_iter, eval_iter
@@ -700,7 +690,7 @@ class Diffusion_SD(torch.nn.Module):
         self.vae_scale_factor = 0.18215
 
         self.sd_scheduler = DDPMScheduler.from_pretrained(
-            "stable-diffusion-v1-5/stable-diffusion-v1-5", subfolder="scheduler"
+            "runwayml/stable-diffusion-v1-5", subfolder="scheduler"
         )
         self.register_buffer('alphas_cumprod', self.sd_scheduler.alphas_cumprod)
         self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(self.sd_scheduler.alphas_cumprod))
@@ -710,32 +700,32 @@ class Diffusion_SD(torch.nn.Module):
         self.score_net = SD15ScoreNet(self.config)
 
         # Optimizer and EMA scoped to scale_head only — frozen UNet is never updated
-        self.optimizer = torch.optim.Adam(
-            self.score_net.scale_head.parameters(),
-            lr=self.config.optim.lr,
-            weight_decay=self.config.optim.get('weight_decay', 0.0),
-        )
-        self.ema = ExponentialMovingAverage(
-            self.score_net.scale_head.parameters(),
-            decay=self.config.optim.get('ema_decay', 0.9999),
-        )
+        # self.optimizer = torch.optim.Adam(
+        #     self.score_net.scale_head.parameters(),
+        #     lr=self.config.optim.lr,
+        #     weight_decay=self.config.optim.get('weight_decay', 0.0),
+        # )
+        # self.ema = ExponentialMovingAverage(
+        #     self.score_net.scale_head.parameters(),
+        #     decay=self.config.optim.get('ema_decay', 0.9999),
+        # )
 
 
         # ← NO self.gamma = get_noise_schedule() here, we use the method below instead
     def gamma(self, t):
         """Log-SNR at integer SD timestep t in [0, 999]."""
-        alpha_bar = self.alphas_cumprod[t].clamp(1e-6, 1 - 1e-6)
+        alpha_bar = self.alphas_cumprod[t]
 
         return torch.log((1.0 - alpha_bar) / alpha_bar)
 
     def sigma2(self, t):
-        return (1.0 - self.alphas_cumprod[t]).clamp(1e-6, 1 - 1e-6)
+        return (1.0 - self.alphas_cumprod[t])
 
     def sigma(self, t):
         return torch.sqrt(self.sigma2(t))
 
     def alpha(self, t):
-        return torch.sqrt(self.alphas_cumprod[t].clamp(1e-6, 1 - 1e-6))
+        return torch.sqrt(self.alphas_cumprod[t])
     
     def q_t(self, x_latent, t=1):
         # q(z_t | x_latent) = N(alpha_t * x_latent, sigma^2_t)
@@ -748,7 +738,7 @@ class Diffusion_SD(torch.nn.Module):
 
     # These remain unchanged
     def p_s_t(self, p_loc, p_scale, t, s):
-
+        # print(p_scale[0][0][0])
         if self.config.model.prior_type == 'logistic':
             base_dist = LogisticDistribution(loc=p_loc, scale=p_scale * np.sqrt(3. / np.pi ** 2))
         elif self.config.model.prior_type in ('gaussian', 'normal'):
@@ -776,8 +766,7 @@ class Diffusion_SD(torch.nn.Module):
         alpha_t, alpha_s = self.alpha(t), self.alpha(s)
         sigma_t, sigma_s = self.sigma(t), self.sigma(s)
         expm1_term = (-torch.special.expm1(gamma_s - gamma_t))
-        null_cond = torch.zeros(z_t.shape[0], 77, 768, device=z_t.device, dtype=z_t.dtype)
-        
+
         if x_latent is None:
             # Predict noise using score network
             if self.config.model.get('learned_prior_scale'):
@@ -832,6 +821,8 @@ class Diffusion_SD(torch.nn.Module):
         q_loc, q_scale = self.get_s_t_params(z_t, t, s, x_latent=x_latent, x_raw_debug=x_raw)
         p_s_t = self.p_s_t(p_loc, p_scale, t, s)
         q_s_t = self.q_s_t(q_loc, q_scale)
+                        # In transmit_q_s_t i=0:
+
         z_s, rate = self.relative_entropy_coding(q_s_t, p_s_t, compress_mode=compress_mode)
 
         return z_s, rate
@@ -861,29 +852,34 @@ class Diffusion_SD(torch.nn.Module):
             subfolder="scheduler"
         )
 
-        if init_z is None:
-            assert shape is not None
-            z = torch.randn(shape, device=device)
-        else:
-            z = init_z
-
+        z = init_z if init_z is not None else torch.randn(shape, device=device)
         if return_hist:
             samples = [z]
 
         null_cond = torch.zeros(z.shape[0], 77, 768, device=device)
 
-        # times is now an integer SD timestep (e.g. 999, 500, 100)
         if times is not None:
-            start_ts = int(times)   # already an integer SD timestep
-            n_steps = max(start_ts // 100, 1)  # proportional number of denoising steps
+            if hasattr(times, '__len__'):
+                # times is a sequence/slice e.g. sd_timesteps[i:]
+                start_ts = int(times[0].item())
+                end_ts   = int(times[-1].item())
+            else:
+                # times is a scalar integer
+                start_ts = int(times)
+                end_ts   = 0
         else:
             start_ts = 999
-            n_steps = 10
+            end_ts   = 0
+
+        n_steps = min(100, start_ts - end_ts)
 
         scheduler.set_timesteps(n_steps)
 
-        # Filter to only timesteps <= start_ts
-        valid_timesteps = [t for t in scheduler.timesteps if t.item() <= start_ts]
+        # Filter to the remaining window [end_ts, start_ts]
+        valid_timesteps = [
+            t for t in scheduler.timesteps
+            if end_ts <= t.item() <= start_ts
+        ]
 
         for t in valid_timesteps:
             noise_pred = self.score_net.unet(z, t, encoder_hidden_states=null_cond).sample
@@ -896,8 +892,15 @@ class Diffusion_SD(torch.nn.Module):
         if return_hist:
             return x_raw, samples + [x_raw]
         return x_raw
-    def forward(self, x_raw, z_1=None, recon_method=None, compress_mode=None, seed=None, eval_steps = 10):
+    def forward(self, x_raw, z_1=None, recon_method=None, compress_mode=None, seed=None, timestep_path=None):
+        """
+        timestep_path: optional list of timesteps defining the diffusion path.
+                    e.g. [999, 381, 0] means two steps: 999→381, then 381→0.
+                    Must be strictly decreasing and start ≤ 999, end ≥ 0.
+                    Default (None) uses all consecutive timesteps [999, 998, ..., 0].
+        """
 
+        print("___________________")
         x_pixel = 2 * ((x_raw.float() + .5) / self.config.model.vocab_size) - 1
         with torch.no_grad():
             x_latent = self.vae.encode(x_pixel).latent_dist.sample() * self.vae_scale_factor
@@ -905,15 +908,24 @@ class Diffusion_SD(torch.nn.Module):
 
         rescale_latent_to_bpd = 1. / (np.prod(x_latent.shape[1:]) * np.log(2.))
         rescale_pixel_to_bpd  = 1. / (np.prod(x_raw.shape[1:])   * np.log(2.))
+        
+        # ------------------------------------------------------------------ #
+        # Resolve the timestep schedule once, used by both train and eval
+        # ------------------------------------------------------------------ #
+        if timestep_path is not None:
+            # User-supplied path, e.g. [999, 381, 0]
+            sd_timesteps = torch.tensor(timestep_path, dtype=torch.long)
+        else:
+            # Default: all consecutive steps [999, 998, ..., 0]
+            sd_timesteps = self.sd_scheduler.timesteps   # [999, 998, ..., 0]
 
-        sd_timesteps = self.sd_scheduler.timesteps   # [999, 998, ..., 0]
-        total_steps  = len(sd_timesteps) - 1         # 999
+        total_steps = len(sd_timesteps) - 1  # number of (t → s) transitions
 
         # ------------------------------------------------------------------ #
         # 1. PRIOR LOSS  (unchanged)
         # ------------------------------------------------------------------ #
         if z_1 is None and not torch.is_inference_mode_enabled():
-            q_1   = self.q_t(x_latent, t=1)
+            q_1   = self.q_t(x_latent, t=sd_timesteps[0].item())
             p_1   = self.p_1()
             with local_seed(seed, i=0):
                 z_1 = q_1.sample()
@@ -926,24 +938,21 @@ class Diffusion_SD(torch.nn.Module):
             loss_prior = torch.zeros(x_latent.shape[0], device=device)
 
         # ------------------------------------------------------------------ #
-        # 2. DIFFUSION LOSS — single random timestep (replaces 1000-step loop)
+        # 2. DIFFUSION LOSS
         # ------------------------------------------------------------------ #
         if not torch.is_inference_mode_enabled():
-            # Sample a random index into the timestep schedule
-            # rand_idx ∈ {0, 1, ..., total_steps-1}
+            # Sample a random index into the (potentially sparse) timestep schedule
             rand_idx = torch.randint(0, total_steps, (1,)).item()
 
-            ts_t = sd_timesteps[rand_idx].item()       # e.g. 742  (the "t" step)
-            ts_s = sd_timesteps[rand_idx + 1].item()   # e.g. 741  (the "s" step)
+            ts_t = sd_timesteps[rand_idx].item()
+            ts_s = sd_timesteps[rand_idx + 1].item()
 
-            # --- Sample z_t in ONE shot via the closed-form marginal ----------
-            # q(z_t | x_latent) = N(alpha_t * x_latent, sigma_t^2)
-            # This replaces the entire sequential z_1 -> ... -> z_t chain
+            # Sample z_t via closed-form marginal q(z_t | x_latent)
             q_t_dist = self.q_t(x_latent, t=ts_t)
             with local_seed(seed, i=rand_idx + 1):
-                z_t = q_t_dist.sample()               # [B, 4, H/8, W/8]
+                z_t = q_t_dist.sample()
 
-            # --- Single KL step, scaled by total_steps (unbiased estimator) --
+            # Single KL step, scaled by total_steps (unbiased estimator)
             p_loc, p_scale = self.get_s_t_params(
                 z_t, ts_t, ts_s,
                 cache_denoised=(recon_method == 'denoise'),
@@ -957,22 +966,19 @@ class Diffusion_SD(torch.nn.Module):
             p_s_t = self.p_s_t(p_loc, p_scale, ts_t, ts_s)
             q_s_t = self.q_s_t(q_loc, q_scale)
 
-            # rate shape: [B, 4, H/8, W/8] — KL for this ONE step
-            # Multiply by total_steps → unbiased estimate of the full sum
             _, rate_one_step = self.relative_entropy_coding(
                 q_s_t, p_s_t, compress_mode=compress_mode
             )
-            loss_diff = rate_one_step    # [B, 4, H/8, W/8] summed below
+            loss_diff = rate_one_step
 
         else:
-            # ---- Inference / eval: keep the full sequential loop -------------
+            # ---- Inference / eval: full sequential loop over sd_timesteps ----
             z_s    = z_1
             rate_s = loss_prior
             loss_diff = 0.
             metrics = []
-            sd_timesteps = torch.linspace(999, 0, eval_steps + 1, dtype=torch.long)  # eval_steps + 1 points = eval_steps steps
 
-            for i in range(eval_steps):
+            for i in range(total_steps):
                 z_t_loop = z_s
                 rate_t   = rate_s
                 ts_t = sd_timesteps[i].item()
@@ -985,6 +991,7 @@ class Diffusion_SD(torch.nn.Module):
                         cache_denoised=(recon_method == 'denoise'),
                         x_raw=x_raw
                     )
+
                 loss_diff += rate_s
 
                 if recon_method is not None:
@@ -1000,9 +1007,8 @@ class Diffusion_SD(torch.nn.Module):
         # ------------------------------------------------------------------ #
         # 3. RECONSTRUCTION LOSS  (unchanged)
         # ------------------------------------------------------------------ #
-        # For training we need z_0: sample it directly from q(z_0 | x_latent)
         if not torch.is_inference_mode_enabled():
-            ts_0       = sd_timesteps[-1].item()   # timestep 0
+            ts_0       = sd_timesteps[-1].item()
             q_0_dist   = self.q_t(x_latent, t=ts_0)
             z_0_latent = q_0_dist.sample()
 
@@ -1013,9 +1019,9 @@ class Diffusion_SD(torch.nn.Module):
         # ------------------------------------------------------------------ #
         # 4. Aggregate
         # ------------------------------------------------------------------ #
-        bpd_latent = torch.mean(loss_prior)    * rescale_latent_to_bpd
-        bpd_diff   = torch.mean(loss_diff)    * rescale_latent_to_bpd
-        bpd_recon  = torch.mean(loss_recon)   * rescale_pixel_to_bpd
+        bpd_latent = torch.mean(loss_prior)  * rescale_latent_to_bpd
+        bpd_diff   = torch.mean(loss_diff)   * rescale_pixel_to_bpd
+        bpd_recon  = torch.mean(loss_recon)  * rescale_pixel_to_bpd
         loss       = bpd_recon + bpd_latent + bpd_diff
 
         if torch.is_inference_mode_enabled() and recon_method is not None:
@@ -1067,20 +1073,20 @@ class Diffusion_SD(torch.nn.Module):
         return k
 
     @torch.inference_mode()
-    def compress(self, image):
+    def compress(self, image, timestep_path=None):
         # return the bits for each step
         self.compress_bits = []
         # accumulate bits
-        self.forward(image.to(device), compress_mode='encode', seed=0)
+        self.forward(image.to(device), compress_mode='encode', seed=0, timestep_path=timestep_path)
         return self.compress_bits
 
     @torch.inference_mode()
-    def decompress(self, bits, image_shape, recon_method='denoise', eval_steps = 10):
+    def decompress(self, bits, image_shape, recon_method='denoise', timestep_path=None):
         # consume the bits for each step, return the intermediate reconstructions for each step
         self.compress_bits = bits.copy()
         # consume the bits for each step
         _, metrics = self.forward(torch.zeros(image_shape, device=device), compress_mode='decode',
-                                  recon_method=recon_method, seed=0,eval_steps = eval_steps)
+                                recon_method=recon_method, seed=0, timestep_path=timestep_path)
         return metrics['prog_x_hats']
 
     def log_probs_x_z0(self, z_0_latent, x_raw=None):
@@ -1290,15 +1296,16 @@ class Diffusion_SD(torch.nn.Module):
     def mse_to_psnr(mse, max_val):
         with np.errstate(divide='ignore'):
             return -10 * (np.log10(mse) - 2 * np.log10(max_val))
-
     @torch.inference_mode()
-    def evaluate(self, eval_iter, n_batches=None, seed=None):
+    def evaluate(self, eval_iter, n_batches=None, seed=None, timestep_path=None):
         """
         Evaluate rate-distortion on the test set.
 
         Inputs:
         -------
-        n_batches - (optionally) give a number of batches to evaluate
+        n_batches     - (optionally) give a number of batches to evaluate
+        timestep_path - (optionally) specify a custom diffusion path,
+                        e.g. [999, 138, 0]. Default (None) uses all consecutive timesteps.
         """
 
         res = []
@@ -1306,28 +1313,25 @@ class Diffusion_SD(torch.nn.Module):
             print('Evaluating batch %s...' % len(res))
             X = X.to(device)
             ths_res = {}
-            
-            recon_method = 'denoise'
-                
-            # If evaluating bpds as file sizes:
-            # self.compress_bits = []
-            # loss, metrics = self(X, recon_method=recon_method, seed=seed, compress_mode='encode')
-            # bpds = np.cumsum([len(b) * 8 for b in self.compress_bits]) / np.prod(X.shape)
-            # print(1)
-            loss, metrics = self(X, recon_method=recon_method, seed=seed)
-            # print(2)
-            bpds = np.cumsum(metrics['prog_bpds'].mean(dim=1))
 
-            # print(3)
+            recon_method = 'denoise'
+
+            loss, metrics = self(X, recon_method=recon_method, seed=seed, timestep_path=timestep_path)
+            print(f"bpd_diff (internal): {metrics['bpd_diff'].item():.4f}")
+            print(f"bpd_latent:      []    {metrics['bpd_latent'].item():.4f}")  
+            print(f"bpd_recon:           {metrics['bpd_recon'].item():.4f}")
+            print(f"bpps[-1] before *3:  {np.cumsum(metrics['prog_bpds'].mean(dim=1))[-1]:.4f}")
+            print(f"bpps[-1] after *3:   {3*np.cumsum(metrics['prog_bpds'].mean(dim=1))[-1]:.4f}")
+
+            bpds =np.cumsum(metrics['prog_bpds'].mean(dim=1))
+
             psnrs = self.mse_to_psnr(metrics['prog_mses'].mean(dim=1), max_val=255.)
-            # print(4)
             ths_res[recon_method] = dict(bpds=bpds, psnrs=psnrs)
-            # print(5)
             res += [ths_res]
         res = default_collate(res)
 
         for recon_method in res.keys():
-            bpps = np.round(3 * res[recon_method]['bpds'].mean(axis=0).numpy(), 4)
+            bpps = np.round(3* res[recon_method]['bpds'].mean(axis=0).numpy(), 4)
             psnrs = np.round(res[recon_method]['psnrs'].mean(axis=0).numpy(), 4)
             print('Reconstructions via: %s\nbpps:  %s\npsnrs: %s\n' % (recon_method, bpps, psnrs))
         return bpps, psnrs
@@ -1431,6 +1435,7 @@ class UQDM_SD(Diffusion_SD):
             x_pixel = 2 * ((x_raw.float() + .5) / self.config.model.vocab_size) - 1
             x_latent = self.vae.encode(x_pixel).latent_dist.sample() * self.vae_scale_factor
             x_latent = x_latent.detach()
+            print(x_raw.shape, x_latent.shape)
             rescale_pixel_to_bpd = 1. / (np.prod(x_raw.shape[1:]) * np.log(2.))
 
             # --- Single shared noise for consistent z_t ---
@@ -1450,6 +1455,8 @@ class UQDM_SD(Diffusion_SD):
 
                 z_t = alpha_t * x_latent + sigma_t * base_eps
                 z_cache[ts_val] = z_t.detach()
+                
+
 
                 gamma_t = self.gamma(ts_tensor)
                 if self.config.model.get('learned_prior_scale'):
@@ -1465,53 +1472,53 @@ class UQDM_SD(Diffusion_SD):
 
             # --- Fill cost matrix ---
             cost_matrix_img = np.zeros((T, T))
+            # After cache phase, before inner loop — one-time check
+            ts_t_check, ts_s_check = timesteps[0], timesteps[1]
+            p_loc_ref, p_scale_ref = self.get_s_t_params(z_cache[ts_t_check], ts_t_check, ts_s_check)
+            q_loc_ref, q_scale_ref = self.get_s_t_params(z_cache[ts_t_check], ts_t_check, ts_s_check, x_latent=x_latent)
 
+            p_loc_cm, p_scale_cm, q_loc_cm, q_scale_cm = self._get_params_from_cache(
+                z_cache[ts_t_check], ts_t_check, ts_s_check, x_latent,
+                eps_cache[ts_t_check], scale_cache[ts_t_check]
+            )
+
+            print("p_loc match:", torch.allclose(p_loc_ref, p_loc_cm, atol=1e-5))
+            print("p_scale match:", torch.allclose(p_scale_ref, p_scale_cm, atol=1e-5))
+            print("q_loc match:", torch.allclose(q_loc_ref, q_loc_cm, atol=1e-5))
+            print("q_scale match:", torch.allclose(q_scale_ref, q_scale_cm, atol=1e-5))
             for i, ts_t in enumerate(timesteps):
-                print(f"  Row {i}/{T-1}")
                 z_t     = z_cache[ts_t]
                 eps_t   = eps_cache[ts_t]
                 scale_t = scale_cache[ts_t]
-                t_tensor = torch.tensor(ts_t, device=x_latent.device)
-
+                print(i)
                 for j in range(i + 1, T):
-                    ts_s     = timesteps[j]
-                    s_tensor = torch.tensor(ts_s, device=x_latent.device)
+                    ts_s = timesteps[j]
 
-                    gamma_t   = self.gamma(t_tensor)
-                    gamma_s   = self.gamma(s_tensor)
-                    alpha_t   = self.alpha(t_tensor)
-                    alpha_s   = self.alpha(s_tensor)
-                    sigma_t   = self.sigma(t_tensor)
-                    sigma_s   = self.sigma(s_tensor)
-                    expm1_term = (-torch.special.expm1(gamma_s - gamma_t))
+                    p_loc, p_scale, q_loc, q_scale = self._get_params_from_cache(
+                        z_t, ts_t, ts_s, x_latent, eps_t, scale_t
+                    )
 
-                    # --- Prior p(z_s | z_t): x_latent=None branch of get_s_t_params ---
-                    p_scale = sigma_s * torch.sqrt(expm1_term)
-                    if self.config.model.get('base_prior_scale', 'forward_kernel') == 'forward_kernel':
-                        p_scale = sigma_t * torch.sqrt(expm1_term)
-                    if self.config.model.get('learned_prior_scale') and scale_t is not None:
-                        p_scale = p_scale * scale_t
-                    # deterministic=False, x_latent=None branch
-                    p_loc = alpha_s / alpha_t * (z_t - sigma_t * expm1_term * eps_t)
-
-                    # --- Posterior q(z_s | z_t, x): x_latent provided branch of get_s_t_params ---
-                    # deterministic=False, x_latent provided
-                    x_hat = (z_t - sigma_t * eps_t) / alpha_t
-                    x_hat = x_hat.clamp(-4.0, 4.0)
-                    q_scale = sigma_s * torch.sqrt(expm1_term)
-                    q_loc   = alpha_s * ((1 - expm1_term) / alpha_t * z_t + expm1_term * x_latent)
-
-                    # --- Build distributions ---
-                    p = self.p_s_t(p_loc, p_scale, t_tensor, s_tensor)
+                    p = self.p_s_t(p_loc, p_scale, ts_t, ts_s)
                     q = self.q_s_t(q_loc, q_scale)
 
-                    # --- Relative entropy coding rate (no compress, just rate) ---
                     with local_seed(seed, i=i * len(timesteps) + j + img_idx * 10_000_000):
                         z_s, rate = self.relative_entropy_coding(q, p, compress_mode=None)
 
-                    rate_bpp = rate.mean().item() * rescale_pixel_to_bpd
-                    cost_matrix_img[i, j] = rate_bpp
-
+                    cost_matrix_img[i, j] = rate.mean().item() * rescale_pixel_to_bpd *3
+                    # In cost matrix, for just the first consecutive step i=0, j=1:
+                    if i == 0 and j == 1:
+                        print(f"rate raw (pre-mean): {rate}")          # shape [B]
+                        print(f"rate.mean(): {rate.mean().item()}")
+                        print(f"rescale_pixel_to_bpd: {rescale_pixel_to_bpd}")
+                        print(f"x_raw.shape: {x_raw.shape}")
+                        print(f"rate_bpp this step: {rate.mean().item() * rescale_pixel_to_bpd}")
+                        
+                        # What evaluate() sees for same step — call transmit_q_s_t directly
+                        with torch.inference_mode():
+                            _, rate_ref = self.transmit_q_s_t(x_latent, z_cache[timesteps[0]], 
+                                                            timesteps[0], timesteps[1])
+                        print(f"transmit_q_s_t rate.mean(): {rate_ref.mean().item()}")
+                        print(f"transmit_q_s_t rate_bpp: {rate_ref.mean().item() * rescale_pixel_to_bpd}")
             cost_matrix_accum += cost_matrix_img
 
             elapsed = time.time() - start_time
@@ -1521,10 +1528,36 @@ class UQDM_SD(Diffusion_SD):
         cost_matrix = cost_matrix_accum / num_images
         psnr_per_timestep = psnr_accum / num_images
         consecutive_bpp = sum(cost_matrix[i, i+1] for i in range(T-1))
-
-
-
         return cost_matrix, timesteps, psnr_per_timestep
+    def _get_params_from_cache(self, z_t, ts_t, ts_s, x_latent, eps_hat, pred_scale_factors):
+        t_tensor   = torch.tensor(ts_t, device=z_t.device)
+        s_tensor   = torch.tensor(ts_s, device=z_t.device)
+        gamma_t    = self.gamma(t_tensor)
+        gamma_s    = self.gamma(s_tensor)
+        alpha_t    = self.alpha(t_tensor)
+        alpha_s    = self.alpha(s_tensor)
+        sigma_t    = self.sigma(t_tensor)
+        sigma_s    = self.sigma(s_tensor)
+        expm1_term = (-torch.special.expm1(gamma_s - gamma_t))
+
+        # ── Prior: identical to before ────────────────────────────────────────
+        p_scale = sigma_s * torch.sqrt(expm1_term)
+        if self.config.model.get('base_prior_scale', 'forward_kernel') == 'forward_kernel':
+            p_scale = sigma_t * torch.sqrt(expm1_term)
+        if self.config.model.get('learned_prior_scale') and pred_scale_factors is not None:
+            p_scale = p_scale * pred_scale_factors
+        p_loc = alpha_s / alpha_t * (z_t - sigma_t * expm1_term * eps_hat)
+
+        # ── Posterior: use TRUE x_latent directly, matching get_s_t_params ───
+        q_scale = sigma_s * torch.sqrt(expm1_term)
+        q_loc   = alpha_s * ((1 - expm1_term) / alpha_t * z_t + expm1_term * x_latent)
+        #                                                                      ^^^^^^^^^
+        #                                                         NOT recomputed from eps
+
+        return p_loc, p_scale, q_loc, q_scale
+
+
+        
     def _get_posterior_params(self, z_t, t, s, x_latent, eps_t, scale_t):
         """Extract q(z_s | z_t, x) loc and scale."""
         alpha_t  = self.alpha(t)
@@ -1690,59 +1723,470 @@ def plot_uqdm_analysis(cost_matrix, timesteps, psnr_per_timestep):
 
     plt.tight_layout()
     plt.savefig('uqdm_analysis.png', dpi=150, bbox_inches='tight')
+"""
+Memory-efficient compression sweep.
+
+Key changes vs original:
+  1. Images are never all loaded into RAM at once — streamed one-by-one.
+  2. Reconstructions are never saved to disk — activations are computed on-the-fly.
+  3. Real image activations are computed once and cached as a .npz, not as ~10k PNGs.
+  4. FID is computed from cached activation stats, not from image folders.
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+
+import numpy as np
+import torch
+from tqdm import tqdm
+from torchvision.utils import save_image
+
+# pip install clean-fid
+from cleanfid.features import build_feature_extractor
+from cleanfid.fid import frechet_distance
+
+
+# ---------------------------------------------------------------------------
+# Feature extractor (InceptionV3) — shared across all stages
+# ---------------------------------------------------------------------------
+
+def _get_feat_model(device):
+    feat_model = build_feature_extractor("clean", device, use_dataparallel=False)
+    return feat_model
+
+
+@torch.inference_mode()
+def _img_to_acts(feat_model, img_uint8_bchw: torch.Tensor, device) -> np.ndarray:
+    import torch.nn.functional as F
+    x = img_uint8_bchw.float().to(device) / 255.0
+    x = F.interpolate(x, size=(299, 299), mode="bilinear", align_corners=False)
+    x = x * 2.0 - 1.0
+    acts = feat_model(x).cpu().numpy()
+    return acts
+
+
+def _compute_stats(all_acts: list) -> tuple:
+    acts = np.concatenate(all_acts, axis=0)   # (N, 2048)
+    print(f"  Computing stats from {acts.shape[0]} images, activation dim {acts.shape[1]}")
+    mu = np.mean(acts, axis=0)                # (2048,)
+    if acts.shape[0] == 1:
+        sigma = np.zeros((acts.shape[1], acts.shape[1]), dtype=np.float64)
+    else:
+        sigma = np.cov(acts, rowvar=False)    # (2048, 2048)
+        # Regularize to avoid singular matrix with small sample sizes
+        sigma += np.eye(sigma.shape[0]) * 1e-6
+    return mu, sigma
+
+
+def compute_real_stats(eval_iter_fn, feat_model, device, cache_path: str):
+    cache = Path(cache_path)
+    if cache.exists():
+        print(f"Loading cached real stats from {cache}")
+        d = np.load(cache)
+        return d["mu"], d["sigma"]
+
+    print("Computing real image stats (one-time)...")
+    all_acts = []
+
+    for batch in tqdm(eval_iter_fn()):
+        img = batch[0] if isinstance(batch, (tuple, list)) else batch
+        if img.ndim == 3:
+            img = img.unsqueeze(0)
+        for i in range(img.shape[0]):
+            single = img[i].unsqueeze(0)
+            acts = _img_to_acts(feat_model, single, device)
+            all_acts.append(acts)
+
+    mu, sigma = _compute_stats(all_acts)
+
+    Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+    np.savez(cache_path, mu=mu, sigma=sigma)
+    print(f"Saved real stats → {cache_path}")
+    return mu, sigma
+def run_stage(model, eval_iter_fn, feat_model, timestep_path, device):
+    from torchmetrics.functional import peak_signal_noise_ratio as psnr
+    from torchmetrics.functional import structural_similarity_index_measure as ssim
+
+    n_steps = len(timestep_path)
+    n_recons = n_steps + 1  # diffusion steps + lossless pixel step
+
+    all_acts_per_step   = [[] for _ in range(n_recons)]
+    total_bpp_per_step  = [0.0] * n_recons
+    total_psnr_per_step = [0.0] * n_recons
+    total_ssim_per_step = [0.0] * n_recons
+    n = 0
+
+    for batch in tqdm(eval_iter_fn()):
+        img = batch[0] if isinstance(batch, (tuple, list)) else batch
+        if img.ndim == 3:
+            img = img.unsqueeze(0)
+        image = img.to(device)
+
+        with torch.inference_mode():
+            compressed = model.compress(image, timestep_path=timestep_path)
+
+        bits = [len(b) * 8 for b in compressed]
+        cumulative_bits = np.cumsum(bits)
+        n_pixels = np.prod(image.shape[-2:])
+        bpp_per_step = cumulative_bits / n_pixels * 3
+
+        for step_idx in range(n_recons):
+            src_idx = min(step_idx, len(bpp_per_step) - 1)
+            total_bpp_per_step[step_idx] += bpp_per_step[src_idx]
+
+        with torch.inference_mode():
+            reconstructions = model.decompress(
+                compressed, image.shape,
+                recon_method="denoise",
+                timestep_path=timestep_path,
+            )
+
+        img_f = image.float()
+        for step_idx, x_hat in enumerate(reconstructions):  # no slice
+            x_hat_f  = x_hat.float().clamp(0, 255).to(device)
+            x_hat_u8 = x_hat_f.byte().cpu()
+
+            psnr_val = psnr(x_hat_f, img_f, data_range=255.0).item()
+            total_psnr_per_step[step_idx] += psnr_val
+            total_ssim_per_step[step_idx] += ssim(x_hat_f, img_f, data_range=255.0).item()
+
+            acts = _img_to_acts(feat_model, x_hat_u8, device)
+            all_acts_per_step[step_idx].append(acts)
+
+        n += 1
+
+    mean_bpp_per_step  = [total_bpp_per_step[i]  / max(n, 1) for i in range(n_recons)]
+    mean_psnr_per_step = [total_psnr_per_step[i] / max(n, 1) for i in range(n_recons)]
+    mean_ssim_per_step = [total_ssim_per_step[i] / max(n, 1) for i in range(n_recons)]
+    stats_per_step     = [_compute_stats(all_acts_per_step[i]) for i in range(n_recons)]
+
+    # extend timesteps to label the extra lossless pixel step (repeats final t)
+    actual_timesteps    = list(timestep_path)
+    extended_timesteps  = actual_timesteps + [actual_timesteps[-1]]
+
+    return stats_per_step, mean_bpp_per_step, mean_psnr_per_step, mean_ssim_per_step, n, extended_timesteps
+
+
+def run_compression_sweep(model, eval_iter_fn, timestep_paths: dict,
+                           out_root="/tmp/fid_sweep"):
+    device = next(model.parameters()).device
+    n_eval = len(eval_iter_fn().dataset)
+    print(f"Total eval images: {n_eval}")
+    if n_eval < 2000:
+        print(f"WARNING: only {n_eval} eval images — FID will run but is not meaningful.")
+
+    feat_model = _get_feat_model(device)
+
+    real_stats_path = Path(out_root) / "real_stats.npz"
+    if n_eval < 2000 and real_stats_path.exists():
+        print("Small dataset — deleting cached real stats.")
+        real_stats_path.unlink()
+
+    mu_real, sigma_real = compute_real_stats(
+        eval_iter_fn, feat_model, device, real_stats_path
+    )
+
+    results = {}
+    checkpoint_path = Path(out_root) / "results_checkpoint.json"
+    if checkpoint_path.exists():
+        with open(checkpoint_path) as f:
+            results = json.load(f)
+        print(f"Resumed from checkpoint: {list(results.keys())} already done")
+
+    for label, timestep_path in timestep_paths.items():
+        if label in results:
+            print(f"Skipping {label} (already in checkpoint)")
+            continue
+
+        print(f"\n=== {label} ===")
+        stats_per_step, mean_bpp_per_step, mean_psnr_per_step, mean_ssim_per_step, n, extended_timesteps = run_stage(
+            model, eval_iter_fn, feat_model, timestep_path, device
+        )
+
+        step_results = []
+        for step_idx, (mu_recon, sigma_recon) in enumerate(stats_per_step):
+            t        = extended_timesteps[step_idx]
+            bpp      = mean_bpp_per_step[step_idx]
+            psnr_val = mean_psnr_per_step[step_idx]
+            ssim_val = mean_ssim_per_step[step_idx]
+
+            is_lossless = not np.isfinite(psnr_val)
+            if is_lossless:
+                print(f"  t={t:4d} [lossless]  bpp={bpp:.4f}  PSNR=inf  SSIM={ssim_val:.4f}")
+            else:
+                fid = fid_from_stats(mu_real, sigma_real, mu_recon, sigma_recon, n)
+                step_results.append({
+                    "timestep": int(t),
+                    "bpp":      bpp,
+                    "fid":      fid,
+                    "psnr":     psnr_val,
+                    "ssim":     ssim_val,
+                    "lossless": False,
+                })
+                print(f"  t={t:4d}  bpp={bpp:.4f}  FID={fid:.2f}  "
+                      f"PSNR={psnr_val:.2f}dB  SSIM={ssim_val:.4f}")
+
+            # always record lossless step separately so it appears in output
+            if is_lossless:
+                step_results.append({
+                    "timestep": int(t),
+                    "bpp":      bpp,
+                    "fid":      None,   # FID undefined for lossless
+                    "psnr":     float("inf"),
+                    "ssim":     float(ssim_val),
+                    "lossless": True,
+                })
+
+        if not step_results:
+            print(f"  WARNING: all steps skipped for {label}")
+            continue
+
+        # summary uses last non-lossless step for fid/psnr, but last step for bpp
+        lossy_results = [s for s in step_results if not s["lossless"]]
+        final = lossy_results[-1] if lossy_results else step_results[-1]
+
+        results[label] = {
+            "bpp":          step_results[-1]["bpp"],   # full rate including lossless
+            "fid":          final["fid"],
+            "psnr":         final["psnr"],
+            "ssim":         final["ssim"],
+            "fid_per_step": step_results,
+        }
+        print(f"  final: bpp={step_results[-1]['bpp']:.4f}  FID={final['fid']:.2f}")
+        with open(checkpoint_path, "w") as f:
+            json.dump(results, f, indent=2)
+
+    return results
+def fid_from_stats(mu_real, sigma_real, mu_recon, sigma_recon, n_images) -> float:
+    if n_images < 2000:
+        print(f"  WARNING: FID computed from only {n_images} images — "
+              f"not statistically meaningful, debugging only")
+    print(f"  mu_real: {mu_real.shape}, sigma_real: {sigma_real.shape}")
+    print(f"  mu_recon: {mu_recon.shape}, sigma_recon: {sigma_recon.shape}")
+    return float(frechet_distance(mu_real, sigma_real, mu_recon, sigma_recon))
 
 
 
-if __name__ == '__main__':
+
+# ---------------------------------------------------------------------------
+# Plotting (unchanged from original)
+# ---------------------------------------------------------------------------
+def plot_fid_vs_rate(fid_results: dict, baselines: dict = None, plot_per_step: bool = True):
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.set_yscale("log")
+
+    if plot_per_step:
+        for label, info in fid_results.items():
+            if "fid_per_step" in info:
+                steps = info["fid_per_step"]
+                bpps  = [s["bpp"] for s in steps]
+                fids  = [s["fid"] for s in steps]
+                ax.plot(bpps, fids, "o-", label=label)
+        ax.set_xlabel("Rate (bpp)", fontsize=13)
+    else:
+        labels = list(fid_results.keys())
+        bpps   = [fid_results[l]["bpp"] for l in labels]
+        fids   = [fid_results[l]["fid"] for l in labels]
+        order  = np.argsort(bpps)
+        ax.plot(np.array(bpps)[order], np.array(fids)[order],
+                "o-", color="orange", label="UQDM", linewidth=2)
+        ax.set_xlabel("Rate (bpp)", fontsize=13)
+
+    ax.set_ylabel("FID", fontsize=13)
+    ax.legend(fontsize=10)
+    ax.grid(True, which="both", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("fid_vs_rate.png", dpi=150)
+    plt.show()
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _unwrap_to_tensor(item) -> torch.Tensor:
+    """
+    Accepts a raw Tensor or a nested iterable and returns a (1, C, H, W) Tensor.
+    """
+    if isinstance(item, torch.Tensor):
+        img = item
+    else:
+        # unwrap one level of generator/list
+        for sub in item:
+            if isinstance(sub, torch.Tensor):
+                img = sub
+                break
+        else:
+            raise ValueError(f"Could not extract a Tensor from item: {type(item)}")
+
+    if img.ndim == 3:
+        img = img.unsqueeze(0)          # (C,H,W) → (1,C,H,W)
+    return img
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', choices=['train', 'eval'], required=True)
-    parser.add_argument('--config_path', default='checkpoints/uqdm-small')
-    parser.add_argument('--ckpt_path', default=None)
-    parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--save_dir', default='reconstructions')
-    parser.add_argument('--eval_steps', type=int, default=10, help='Number of steps to evaluate for intermediate decompressed image')
-    parser.add_argument('--recon_method', choices=['ancestral', 'flow_based', 'denoise'], default='ancestral', help='Method for intermediate reconstructions during evaluation')
+    parser.add_argument("--mode", choices=["train", "eval"], required=True)
+    parser.add_argument("--config_path", default="checkpoints/uqdm-small")
+    parser.add_argument("--ckpt_path", default=None)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--save_dir", default="reconstructions")
+    parser.add_argument("--eval_steps", type=int, default=999)
+    parser.add_argument("--recon_method",
+                        choices=["ancestral", "flow_based", "denoise"],
+                        default="ancestral")
     args = parser.parse_args()
- 
+
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.use_deterministic_algorithms(True)
- 
+
     model = load_checkpoint_SD(config_path=args.config_path, ckpt_path=args.ckpt_path)
-    train_iter, eval_iter = load_data_from_folder()
+    train_iter, eval_iter = load_data_from_folder("data_1/", resolution=512)
+
+    timestep_paths = {
+        "stage_5": [999, 799, 599, 399, 199, 1, 0],
+    }
+
+    results = run_compression_sweep(
+        model=model,
+        eval_iter_fn=lambda: load_data_from_folder("data_1/", resolution=512)[1],
+        timestep_paths=timestep_paths,
+        out_root="/home/lu/Documents/uqdm/fid_sweep"
+    )
+
+    with open("/home/lu/Documents/uqdm/fid_results.json", "w") as f:
+        json.dump(results, f, indent=2)
+    print("Saved fid_results.json")
+
+    # plot_fid_vs_rate(results)
+    # resolutions = [64, 256,512]
+    # results = {}
+
+    # for res in resolutions:
+    #     print(f"\n=== Evaluating resolution {res} ===")
+
+    #     if res == 64:
+    #         train_iter, eval_iter = load_data('ImageNet64', model.config.data)
+    #     else:
+    #         train_iter, eval_iter = load_data_from_folder('data_1/', resolution=res)
+
+    #     bpps, psnrs = model.evaluate(eval_iter, n_batches=5, seed=seed, timestep_path=None)
+    #     results[res] = {
+    #         'bpps': np.array(bpps),
+    #         'psnrs': np.array(psnrs)
+    #     }
+
+
+    # # Plot
+    # from scipy.ndimage import uniform_filter1d
+
+    # line_styles = {64: '-', 256: '--', 512: ':'}
+    # colors      = {64: 'orange', 256: 'steelblue', 512: 'green'}
+
+    # fig, ax = plt.subplots(figsize=(10, 6))
+    # for res in resolutions:
+    #     bpps   = results[res]['bpps']
+    #     psnrs  = uniform_filter1d(results[res]['psnrs'], size=20)
+    #     ax.plot(
+    #         bpps, psnrs,
+    #         line_styles[res],
+    #         label=f'UQDM-SD {res}×{res}',
+    #         linewidth=1,
+    #         color=colors[res]
+    #     )
+    #     with open(f'uqdm_sd_rd_data_{res}x{res}.txt', 'w') as f:
+    #         f.write(f'# UQDM-SD Rate-Distortion Data ({res}x{res})\n')
+    #         f.write('# Row 1: BPP, Row 2: PSNR (dB)\n')
+    #         f.write(' '.join(f'{bpp:.6f}' for bpp in bpps) + '\n')
+    #         f.write(' '.join(f'{psnr:.6f}' for psnr in psnrs) + '\n')
+    #     print(f"Saved R-D data to uqdm_sd_rd_data_{res}x{res}.txt")
+
+    # ax.set_xlabel('Rate (BPP)', fontsize=13)
+    # ax.set_ylabel('PSNR (dB)', fontsize=13)
+    # ax.set_title('UQDM-SD: Rate-Distortion Curve (Multi-Resolution)', fontsize=14)
+    # ax.legend(fontsize=12, loc='lower right')
+    # ax.grid(True, alpha=0.3)
+    # plt.tight_layout()
+    # plt.savefig('uqdm_sd_rd_curve_multiresolution.png', dpi=150, bbox_inches='tight')
+    # print("Saved plot to uqdm_sd_rd_curve_multiresolution.png")
+
+    # Compress one image
+    # Compress one image
+
+
  
+    # import matplotlib.pyplot as plt
+    # import numpy as np
+
     if args.mode == 'train':
-        model.trainer(train_iter, eval_iter)
+        timesteps = model.sd_scheduler.timesteps.cpu().numpy()
+        alpha = model.alpha(model.sd_scheduler.timesteps).cpu().numpy()
+        sigma = model.sigma(model.sd_scheduler.timesteps).cpu().numpy()
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+        axes[0].plot(timesteps, alpha)
+        axes[0].set_title('Alpha')
+        axes[0].set_xlabel('Timestep')
+        axes[0].set_ylabel('Alpha')
+        axes[0].grid(True)
+
+        axes[1].plot(timesteps, sigma)
+        axes[1].set_title('Sigma')
+        axes[1].set_xlabel('Timestep')
+        axes[1].set_ylabel('Sigma')
+        axes[1].grid(True)
+
+        plt.tight_layout()
+        plt.savefig('noise_schedule.png')
+        plt.show()
+        # model.trainer(train_iter, eval_iter)
  
     elif args.mode == 'eval':
-        image = next(iter(eval_iter))
-        print(image.shape)
-        compressed = model.compress(image)
-        bits = [len(b) * 8 for b in compressed]
- 
-        reconstructions = model.decompress(compressed, image.shape, recon_method=args.recon_method, eval_steps=args.eval_steps)
- 
-        bpps = np.round(np.cumsum(bits) / np.prod(image.shape) * 3, 4)
-        print('Reconstructions via: ancestral, compression to bits\nbpps:  %s' % bpps)
- 
+
         os.makedirs(args.save_dir, exist_ok=True)
-        img_original = image.squeeze().cpu().float().div(255).clamp(0, 1)
-        reconstructions = reconstructions.cpu() / 255.0
+
+   
  
-        indices = np.linspace(0, len(reconstructions) - 1, 10, dtype=int)
-        selected = [reconstructions[i].squeeze().clamp(0, 1) for i in indices]
- 
-        all_images = torch.stack([img_original] + selected, dim=0)
-        grid = vutils.make_grid(all_images, nrow=11, padding=4, pad_value=1.0)
-        plt.imsave(os.path.join(args.save_dir, 'comparison_grid.png'), grid.permute(1, 2, 0).numpy())
-        print(f'Saved comparison grid to {args.save_dir}/comparison_grid.png')
- 
-        cost_matrix, timesteps, psnr_per_timestep = model.compute_cost_matrix_uqdm(
-            iter(train_iter), seed=args.seed, timestep_stride=1, num_images=3, cache_path=""
-        )
-        plot_uqdm_analysis(cost_matrix, timesteps, psnr_per_timestep)
- 
-        optimal_path, path_timesteps, breakdown = find_optimal_path_dp(cost_matrix, timesteps)
-        print(f"{breakdown['optimal_total_bpp']:.6f} bpp", breakdown['consecutive_bpp'])
-        print(f"{breakdown['num_transitions']:.2f} transitions  ", breakdown['saving_bpp'])
+
+        # # Save original
+        # plt.imsave(
+        #     os.path.join(args.save_dir, 'original.png'),
+        #     img_original.permute(1, 2, 0).numpy()
+        # )
+
+        # # Save each reconstruction
+        # for rank in range(len(reconstructions)):
+        #     img = reconstructions[rank].squeeze().clamp(0, 1)
+        #     plt.imsave(
+        #         os.path.join(args.save_dir, f'recon_{rank:04d}.png'),
+        #         img.permute(1, 2, 0).numpy()
+        #     )
+
+        # print(f'Saved original + {len(reconstructions)} reconstructions to {args.save_dir}/')
+        # cost_matrix, timesteps, psnr_per_timestep = model.compute_cost_matrix_uqdm(
+        #     iter(train_iter), seed=args.seed, timestep_stride=1, num_images=1, cache_path=""
+        # )
+        # plot_uqdm_analysis(cost_matrix, timesteps, psnr_per_timestep)
+        # consecutive_bpp = sum(cost_matrix[i, i+1] for i in range(len(timesteps)-1))
+        # print(f"Cost matrix consecutive bpp: {consecutive_bpp:.4f}")
+        # print(f"Evaluate bpp:                1.75")  
+        # print(f"Num timesteps in matrix:     {len(timesteps)}")
+        # print(f"Timesteps sample:            {timesteps[:5]}...{timesteps[-5:]}")
+        # print(f"Non-zero entries:            {(cost_matrix > 0).sum()}")
+
+        # # Also print per-step to see where the cost concentrates
+        # step_costs = [cost_matrix[i, i+1] for i in range(len(timesteps)-1)]
+        # print(f"Mean per-step bpp:           {np.mean(step_costs):.6f}")
+        # print(f"Max per-step bpp:            {np.max(step_costs):.6f}  at step {np.argmax(step_costs)}")
+        # print(f"Steps with bpp > 0.01:       {sum(c > 0.01 for c in step_costs)}")
+        # optimal_path, path_timesteps, breakdown = find_optimal_path_dp(cost_matrix, timesteps)
+        # print(f"{breakdown['optimal_total_bpp']:.6f} bpp", breakdown['consecutive_bpp'])
+        # print(f"{breakdown['num_transitions']:.2f} transitions  ", breakdown['saving_bpp'])
