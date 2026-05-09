@@ -56,15 +56,31 @@ class SD15ScoreNet(torch.nn.Module):
             subfolder="scheduler"
         )
 
-        # Precompute analytic posterior variance from scheduler buffers.
-        # tilde_beta_t = (1 - alpha_bar_{t-1}) / (1 - alpha_bar_t) * beta_t
-        # For t=0 we clamp to beta_0 (no previous step exists).
-        alphas_cumprod = self.sd_scheduler.alphas_cumprod
-        alphas_cumprod_prev = torch.cat([torch.tensor([1.0]), alphas_cumprod[:-1]])
-        betas = 1.0 - alphas_cumprod / alphas_cumprod_prev
-        self.register_buffer("analytic_scale", betas.sqrt()) 
+        # Scale head takes the penultimate UNet latent (320 channels from conv_in path)
+        # SD1.5 UNet final conv_out goes from 320 -> 4, so we hook before it
+        penultimate_channels = self.unet.conv_out.in_channels  # typically 320
+        self.scale_head = nn.Sequential(
+            nn.Conv2d(penultimate_channels, 64, kernel_size=1),
+            nn.SiLU(),
+            nn.Conv2d(64, 4, kernel_size=1),
+        ).cuda()
 
-    # scale_head, _register_penultimate_hook, and the hook itself are all removed.
+        # # Zero-init the last layer for stable training start
+        nn.init.kaiming_normal_(self.scale_head[0].weight, mode='fan_out', nonlinearity='relu')
+        nn.init.zeros_(self.scale_head[0].bias)
+        nn.init.xavier_normal_(self.scale_head[-1].weight, gain=0.01)  # small but non-zero
+        nn.init.zeros_(self.scale_head[-1].bias)
+
+        self._penultimate_latent = None
+        self._register_penultimate_hook()
+
+    def _register_penultimate_hook(self):
+        """Hook the layer immediately before conv_out to capture its output."""
+        def hook_fn(module, input, output):
+            # input[0] is the tensor fed into conv_out — the penultimate latent
+            self._penultimate_latent = input[0]
+
+        self.unet.conv_out.register_forward_hook(hook_fn)
 
     def softplus_init1(self, x):
         return torch.nn.functional.softplus(x + self.SOFTPLUS_INV1)
@@ -75,22 +91,20 @@ class SD15ScoreNet(torch.nn.Module):
         alpha2_target = torch.sigmoid(-g_t)
         alphas_cumprod = self.sd_scheduler.alphas_cumprod.to(z.device)
         diffs = (alphas_cumprod.unsqueeze(0) - alpha2_target.unsqueeze(1)).abs()
-        timesteps = diffs.argmin(dim=1).long()                      # [B]
+        timesteps = diffs.argmin(dim=1).long()
 
         null_cond = torch.zeros(z.shape[0], 77, 768, device=z.device, dtype=z.dtype)
 
+        # UNet forward — no grad for the UNet weights, but hook captures the
+        # penultimate latent so scale_head can still receive gradients through it
         with torch.no_grad():
             eps_hat = self.unet(z, timesteps, encoder_hidden_states=null_cond).sample
 
-        # Look up the analytic posterior variance for each sample's timestep.
-        # Expand to [B, 1, 1, 1] so it broadcasts over the spatial latent dims.
-        # var = self.posterior_variance[timesteps].to(z.dtype)        # [B]
-        # var = var[:, None, None, None]                              # [B, 1, 1, 1]
+        # _penultimate_latent was captured inside the no_grad block, so we must
+        # re-enable grad for the scale_head branch
+        penultimate = self._penultimate_latent
 
-        # Broadcast to match the latent spatial shape [B, 4, H, W]
-        scale = self.analytic_scale[timesteps].to(z.dtype)
-        pred_scale_factors = scale[:, None, None, None].expand_as(eps_hat)
-
+        pred_scale_factors = self.softplus_init1(self.scale_head(penultimate))
         return eps_hat, pred_scale_factors
 class ExponentialMovingAverage:
     """
@@ -700,15 +714,15 @@ class Diffusion_SD(torch.nn.Module):
         self.score_net = SD15ScoreNet(self.config)
 
         # Optimizer and EMA scoped to scale_head only — frozen UNet is never updated
-        # self.optimizer = torch.optim.Adam(
-        #     self.score_net.scale_head.parameters(),
-        #     lr=self.config.optim.lr,
-        #     weight_decay=self.config.optim.get('weight_decay', 0.0),
-        # )
-        # self.ema = ExponentialMovingAverage(
-        #     self.score_net.scale_head.parameters(),
-        #     decay=self.config.optim.get('ema_decay', 0.9999),
-        # )
+        self.optimizer = torch.optim.Adam(
+            self.score_net.scale_head.parameters(),
+            lr=self.config.optim.lr,
+            weight_decay=self.config.optim.get('weight_decay', 0.0),
+        )
+        self.ema = ExponentialMovingAverage(
+            self.score_net.scale_head.parameters(),
+            decay=self.config.optim.get('ema_decay', 0.9999),
+        )
 
 
         # ← NO self.gamma = get_noise_schedule() here, we use the method below instead
