@@ -310,7 +310,7 @@ def load_data_from_folder(folder_path='data_1/', resolution=512):
     # full_dataset = torch.utils.data.Subset(full_dataset, range(10))
 
     total_size = len(full_dataset)
-    train_size = len(full_dataset) -2000
+    train_size = 1
     eval_size = total_size - train_size
     train_data, eval_data = random_split(full_dataset, [train_size, eval_size])
 
