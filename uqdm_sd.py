@@ -321,14 +321,14 @@ def load_data_from_folder(folder_path='data_1/', resolution=512):
             return image
 
     full_dataset = ImageFolderFlat(folder_path)
-    # full_dataset = torch.utils.data.Subset(full_dataset, range(10))
+    full_dataset = torch.utils.data.Subset(full_dataset, range(100))
 
     total_size = len(full_dataset)
     train_size = 1
     eval_size = total_size - train_size
     train_data, eval_data = random_split(full_dataset, [train_size, eval_size])
 
-    train_iter = DataLoader(train_data, batch_size=1, shuffle=True,
+    train_iter = DataLoader(train_data, batch_size=32, shuffle=True,
                             pin_memory=True, num_workers=0)
     eval_iter = DataLoader(eval_data, batch_size=1, shuffle=False,
                            pin_memory=True, num_workers=0)
@@ -769,8 +769,7 @@ class Diffusion_SD(torch.nn.Module):
 
     def relative_entropy_coding(self, q, p, compress_mode=None):
         raise NotImplementedError
-
-    def get_s_t_params(self, z_t, t, s, x_latent=None, clip_denoised=True, cache_denoised=False, deterministic=False, x_raw_debug=None):
+    def get_s_t_params(self, z_t, t, s, x_latent=None, clip_denoised=True, cache_denoised=False, deterministic=False):
         """
         Now works in LATENT SPACE.
         z_t: [B, 4, H/8, W/8] noisy latent
@@ -785,10 +784,8 @@ class Diffusion_SD(torch.nn.Module):
             # Predict noise using score network
             if self.config.model.get('learned_prior_scale'):
                 eps_hat, pred_scale_factors = self.score_net(z_t, gamma_t)
-
-
             else:
-                eps_hat,pred_scale_factors  = self.score_net(z_t, gamma_t)
+                eps_hat,_  = self.score_net(z_t, gamma_t)
             
             # Compute denoised prediction in LATENT space
             if clip_denoised or cache_denoised:
@@ -831,8 +828,8 @@ class Diffusion_SD(torch.nn.Module):
 
     def transmit_q_s_t(self, x_latent, z_t, t, s, compress_mode=None, cache_denoised=False,x_raw=None):
         """Now x_latent is in latent space"""
-        p_loc, p_scale = self.get_s_t_params(z_t, t, s, cache_denoised=cache_denoised, x_raw_debug=x_raw)
-        q_loc, q_scale = self.get_s_t_params(z_t, t, s, x_latent=x_latent, x_raw_debug=x_raw)
+        p_loc, p_scale = self.get_s_t_params(z_t, t, s, cache_denoised=cache_denoised)
+        q_loc, q_scale = self.get_s_t_params(z_t, t, s, x_latent=x_latent)
         p_s_t = self.p_s_t(p_loc, p_scale, t, s)
         q_s_t = self.q_s_t(q_loc, q_scale)
                         # In transmit_q_s_t i=0:
@@ -851,6 +848,7 @@ class Diffusion_SD(torch.nn.Module):
         if compress_mode == 'decode':
             x_raw = self.entropy_decode(self.compress_bits.pop(0), p)
         elif compress_mode == 'encode':
+            print(123)
             self.compress_bits += [self.entropy_encode(x_raw, p)]
         return x_raw
 
@@ -907,163 +905,130 @@ class Diffusion_SD(torch.nn.Module):
             return x_raw, samples + [x_raw]
         return x_raw
     def forward(self, x_raw, z_1=None, recon_method=None, compress_mode=None, seed=None, timestep_path=None):
-        """
-        timestep_path: optional list of timesteps defining the diffusion path.
-                    e.g. [999, 381, 0] means two steps: 999→381, then 381→0.
-                    Must be strictly decreasing and start ≤ 999, end ≥ 0.
-                    Default (None) uses all consecutive timesteps [999, 998, ..., 0].
-        """
-
         print("___________________")
         x_pixel = 2 * ((x_raw.float() + .5) / self.config.model.vocab_size) - 1
         with torch.no_grad():
             x_latent = self.vae.encode(x_pixel).latent_dist.sample() * self.vae_scale_factor
             x_latent = x_latent.detach()
 
-        rescale_latent_to_bpd = 1. / (np.prod(x_latent.shape[1:]) * np.log(2.))
-        rescale_pixel_to_bpd  = 1. / (np.prod(x_raw.shape[1:])   * np.log(2.))
-        
-        # ------------------------------------------------------------------ #
-        # Resolve the timestep schedule once, used by both train and eval
-        # ------------------------------------------------------------------ #
+        rescale_pixel_to_bpd = 1. / (np.prod(x_raw.shape[1:]) * np.log(2.))
+
         if timestep_path is not None:
-            # User-supplied path, e.g. [999, 381, 0]
             sd_timesteps = torch.tensor(timestep_path, dtype=torch.long)
         else:
-            # Default: all consecutive steps [999, 998, ..., 0]
-            sd_timesteps = self.sd_scheduler.timesteps   # [999, 998, ..., 0]
+            sd_timesteps = self.sd_scheduler.timesteps
+        total_steps = len(sd_timesteps) - 1
 
-        total_steps = len(sd_timesteps) - 1  # number of (t → s) transitions
-
-        # ------------------------------------------------------------------ #
-        # 1. PRIOR LOSS  (unchanged)
-        # ------------------------------------------------------------------ #
+        # ── 1. PRIOR LOSS ────────────────────────────────────────────────────────
         if z_1 is None and not torch.is_inference_mode_enabled():
-            q_1   = self.q_t(x_latent, t=sd_timesteps[0].item())
-            p_1   = self.p_1()
+            q_1        = self.q_t(x_latent, t=sd_timesteps[0].item())
+            p_1        = self.p_1()
             with local_seed(seed, i=0):
-                z_1 = q_1.sample()
+                z_1    = q_1.sample()
             loss_prior = kl_divergence(q_1, p_1).sum(dim=[1, 2, 3])
         else:
             if z_1 is None:
-                p_1 = self.p_1()
                 with local_seed(seed, i=0):
-                    z_1 = p_1.sample(x_latent.shape)
+                    z_1 = self.p_1().sample(x_latent.shape)
             loss_prior = torch.zeros(x_latent.shape[0], device=device)
 
-        # ------------------------------------------------------------------ #
-        # 2. DIFFUSION LOSS
-        # ------------------------------------------------------------------ #
+        # ── 2. DIFFUSION LOSS ────────────────────────────────────────────────────
         if not torch.is_inference_mode_enabled():
-            # Sample a random index into the (potentially sparse) timestep schedule
-            rand_idx = torch.randint(0, total_steps, (1,)).item()
+            # Training: single random step, scaled by total_steps (unbiased estimator)
+            rand_idx  = torch.randint(0, total_steps, (1,)).item()
+            ts_t      = sd_timesteps[rand_idx].item()
+            ts_s      = sd_timesteps[rand_idx + 1].item()
 
-            ts_t = sd_timesteps[rand_idx].item()
-            ts_s = sd_timesteps[rand_idx + 1].item()
-
-            # Sample z_t via closed-form marginal q(z_t | x_latent)
-            q_t_dist = self.q_t(x_latent, t=ts_t)
+            q_t_dist  = self.q_t(x_latent, t=ts_t)
             with local_seed(seed, i=rand_idx + 1):
-                z_t = q_t_dist.sample()
+                z_t   = q_t_dist.sample()
 
-            # Single KL step, scaled by total_steps (unbiased estimator)
-            p_loc, p_scale = self.get_s_t_params(
-                z_t, ts_t, ts_s,
-                cache_denoised=(recon_method == 'denoise'),
-                x_raw_debug=x_raw
-            )
-            q_loc, q_scale = self.get_s_t_params(
-                z_t, ts_t, ts_s,
-                x_latent=x_latent,
-                x_raw_debug=x_raw
-            )
-            p_s_t = self.p_s_t(p_loc, p_scale, ts_t, ts_s)
-            q_s_t = self.q_s_t(q_loc, q_scale)
+            p_loc, p_scale = self.get_s_t_params(z_t, ts_t, ts_s,
+                                cache_denoised=(recon_method == 'denoise'))
+            q_loc, q_scale = self.get_s_t_params(z_t, ts_t, ts_s, x_latent=x_latent)
 
             _, rate_one_step = self.relative_entropy_coding(
-                q_s_t, p_s_t, compress_mode=compress_mode
+                self.q_s_t(q_loc, q_scale),
+                self.p_s_t(p_loc, p_scale, ts_t, ts_s),
+                compress_mode=compress_mode,
             )
-            loss_diff = rate_one_step
+            # Scale by total_steps: single-sample unbiased estimator of the full sum
+            loss_diff = rate_one_step * total_steps
 
-        else:
-            # ---- Inference / eval: full sequential loop over sd_timesteps ----
-            z_s    = z_1
-            rate_s = loss_prior
+        else:       
+            # Eval: full sequential loop
+            z_s       = z_1
             loss_diff = 0.
-            metrics = []
+            metrics   = []
+            _nan_rate = torch.full((x_latent.shape[0],), float('nan'))
+            prev_rate = loss_prior  # mirrors original: rate_t = rate_s = loss_prior at start
 
             for i in range(total_steps):
                 z_t_loop = z_s
-                rate_t   = rate_s
-                ts_t = sd_timesteps[i].item()
-                ts_s = sd_timesteps[i + 1].item()
+                ts_t     = sd_timesteps[i].item()
+                ts_s     = sd_timesteps[i + 1].item()
 
                 with local_seed(seed, i=i + 1):
                     z_s, rate_s = self.transmit_q_s_t(
                         x_latent, z_t_loop, ts_t, ts_s,
                         compress_mode=compress_mode,
                         cache_denoised=(recon_method == 'denoise'),
-                        x_raw=x_raw
+                        x_raw=x_raw,
                     )
-
                 loss_diff += rate_s
 
                 if recon_method is not None:
-                    x_hat_t = self.denoise_z_t(z_t_loop, recon_method, times=ts_t)
+                    x_hat_t = self.denoise_z_t(z_t_loop, recon_method, times=sd_timesteps[i:])
                     metrics += [{
-                        'prog_bpds': rate_t.cpu() * rescale_pixel_to_bpd,
+                        'prog_bpds':   prev_rate.cpu() * rescale_pixel_to_bpd,  # prev rate
                         'prog_x_hats': x_hat_t.detach().cpu(),
-                        'prog_mses': torch.mean((x_hat_t - x_raw).float() ** 2, dim=[1, 2, 3]).cpu(),
+                        'prog_mses':   torch.mean((x_hat_t - x_raw).float()**2, dim=[1,2,3]).cpu(),
                     }]
+
+                prev_rate = rate_s  # update for next iteration
 
             z_0_latent = z_s
 
-        # ------------------------------------------------------------------ #
-        # 3. RECONSTRUCTION LOSS  (unchanged)
-        # ------------------------------------------------------------------ #
+        # ── 3. RECONSTRUCTION LOSS ───────────────────────────────────────────────
         if not torch.is_inference_mode_enabled():
-            ts_0       = sd_timesteps[-1].item()
-            q_0_dist   = self.q_t(x_latent, t=ts_0)
-            z_0_latent = q_0_dist.sample()
+            z_0_latent = self.q_t(x_latent, t=sd_timesteps[-1].item()).sample()
 
         log_probs  = self.log_probs_x_z0(z_0_latent=z_0_latent, x_raw=x_raw)
         loss_recon = -log_probs.sum(dim=[1, 2, 3])
         x_raw      = self.transmit_image(z_0_latent, x_raw, compress_mode=compress_mode)
 
-        # ------------------------------------------------------------------ #
-        # 4. Aggregate
-        # ------------------------------------------------------------------ #
-        bpd_latent = torch.mean(loss_prior)  * rescale_latent_to_bpd
-        bpd_diff   = torch.mean(loss_diff)   * rescale_pixel_to_bpd
-        bpd_recon  = torch.mean(loss_recon)  * rescale_pixel_to_bpd
-        loss       = bpd_recon + bpd_latent + bpd_diff
+        # ── 4. Aggregate ─────────────────────────────────────────────────────────
+        bpd_latent = loss_prior.mean() * rescale_pixel_to_bpd
+        bpd_diff   = loss_diff.mean()  * rescale_pixel_to_bpd
+        bpd_recon  = loss_recon.mean() * rescale_pixel_to_bpd
+        loss       = bpd_latent + bpd_diff + bpd_recon
 
         if torch.is_inference_mode_enabled() and recon_method is not None:
-            if recon_method == 'ancestral':
-                x_hat_t = self.decode_p_x_z_0(z_0_latent=z_0_latent, method='sample')
-            else:
-                x_hat_t = self.decode_p_x_z_0(z_0_latent=z_0_latent, method='argmax')
+            # mirrors original: rate_s (last step) + decode from clean z_0
+            x_hat_final = (self.decode_p_x_z_0(z_0_latent, method='sample')
+                        if recon_method == 'ancestral'
+                        else self.decode_p_x_z_0(z_0_latent, method='argmax'))
             metrics += [{
-                'prog_bpds': rate_s.cpu() * rescale_pixel_to_bpd,
-                'prog_x_hats': x_hat_t.detach().cpu(),
-                'prog_mses': torch.mean((x_hat_t - x_raw).float() ** 2, dim=[1, 2, 3]).cpu(),
+                'prog_bpds':   prev_rate.cpu() * rescale_pixel_to_bpd,  # last step's rate
+                'prog_x_hats': x_hat_final.detach().cpu(),
+                'prog_mses':   torch.mean((x_hat_final - x_raw).float()**2, dim=[1,2,3]).cpu(),
             }]
+            # mirrors original: loss_recon + ground truth
             metrics += [{
-                'prog_bpds': loss_recon.cpu() * rescale_pixel_to_bpd,
+                'prog_bpds':   loss_recon.cpu() * rescale_pixel_to_bpd,
                 'prog_x_hats': x_raw.cpu(),
-                'prog_mses': torch.zeros(x_pixel.shape[:1]),
+                'prog_mses':   torch.zeros(x_raw.shape[0]),
             }]
             metrics = default_collate(metrics)
         else:
             metrics = {}
 
         metrics.update({
-            "bpd":        loss,
-            "bpd_latent": bpd_latent,
-            "bpd_recon":  bpd_recon,
-            "bpd_diff":   bpd_diff,
+            'bpd':        loss,
+            'bpd_latent': bpd_latent,
+            'bpd_recon':  bpd_recon,
+            'bpd_diff':   bpd_diff,
         })
-
         return loss, metrics
 
     def entropy_encode(self, k, p):
@@ -1072,7 +1037,7 @@ class Diffusion_SD(torch.nn.Module):
         We might want to quantize scale for determinism and added stability across multiple machines.
         """
         # When using a scalar prior it would be better to quantize u as in tfc.UniversalBatchedEntropyModel
-        assert self.config.model.learned_prior_scale
+        # assert self.config.model.learned_prior_scale
         em = EntropyModel(p)
         bitstring = em.compress(k)
         return bitstring
@@ -1081,17 +1046,20 @@ class Diffusion_SD(torch.nn.Module):
         """
         Decode integer array from bits using the prior p.
         """
-        assert self.config.model.learned_prior_scale
+        # assert self.config.model.learned_prior_scale
         em = EntropyModel(p)
         k = em.decompress(bits)
         return k
 
     @torch.inference_mode()
     def compress(self, image, timestep_path=None):
+
         # return the bits for each step
         self.compress_bits = []
+
         # accumulate bits
         self.forward(image.to(device), compress_mode='encode', seed=0, timestep_path=timestep_path)
+        print(len(self.compress_bits ))
         return self.compress_bits
 
     @torch.inference_mode()
@@ -1103,36 +1071,51 @@ class Diffusion_SD(torch.nn.Module):
                                 recon_method=recon_method, seed=0, timestep_path=timestep_path)
         return metrics['prog_x_hats']
 
-    def log_probs_x_z0(self, z_0_latent, x_raw=None):
+    def log_probs_x_z0(self, z_0, x_raw=None):
         """
-        Decode z_0_latent and compute pixel probabilities
-        z_0_latent: [B, 4, H/8, W/8]
+        Computes log p(x_raw | z_0), under the Gaussian approximation of q(z_0|x) introduced in VDM, section 3.3.
+        If `x_raw` is not provided, this method computes the log probs of every
+        possible value of x_raw under a factorized categorical distribution; otherwise,
+        it will evaluate the log probs of the given `x_raw`.
+
+        Internally we compute p(x_i | z_0i), with i = pixel index, for all possible values
+        of x_i in the vocabulary. We approximate this with q(z_0i | x_i).
+        Un-normalized logits are: -1/2 SNR_0 (z_0 / alpha_0 - k)^2
+        where k takes all possible x_i values. Logits are then normalized to logprobs.
+
+        If `x_raw` is None, the method returns a tensor of shape (B, C, H, W,
+        vocab_size) containing, for each pixel, the log probabilities for all
+        `vocab_size` possible values of that pixel. The output sums to 1 over
+        the last dimension. Otherwise, we will select the log probs of the given `x_raw`.
+
+        Inputs:
+        -------
+        z_0   - z_0 to be decoded, shape (B, C, H, W).
+        x_raw - Input uint8 image, shape (B, C, H, W).
+
+        Returns:
+        --------
+        log_probs - Log probabilities [B, C, H, W, vocab_size] if `x_raw` is None else [B, C, H, W]
         """
-        # Decode latent to pixel space
-        with torch.no_grad():
-            z_0_pixel = self.vae.decode(z_0_latent / self.vae_scale_factor).sample
-        
-        gamma_0 = self.gamma(torch.tensor([0], device=device))
-
-        z_0_rescaled = z_0_pixel / torch.sqrt(torch.sigmoid(-gamma_0))
-
-        
+        gamma_0 = self.gamma(torch.tensor([0.0], device=device))
+        z_0_rescaled = z_0 / torch.sqrt(torch.sigmoid(-gamma_0))
+        # Compute a tensor of log p(x | z) for all possible values of x.
+        # Logits are exact if there are no dependencies between dimensions of x
         x_vals = torch.arange(self.config.model.vocab_size, device=z_0_rescaled.device)
-        
         x_vals = 2 * ((x_vals + .5) / self.config.model.vocab_size) - 1
         x_vals = torch.reshape(x_vals, [1] * z_0_rescaled.ndim + [-1])
-        
-        z = z_0_rescaled.unsqueeze(-1)
-
-        logits = -0.5 * torch.exp(-gamma_0) *  (z - x_vals) ** 2
-
-        logprobs = torch.log_softmax(logits, dim=-1)
+        z = z_0_rescaled.unsqueeze(-1)  # (B, D1, ..., D_n) -> (B, D1, ..., D_n, 1) for broadcasting
+        logits = -0.5 * torch.exp(-gamma_0) * (z - x_vals) ** 2  # (B, D1, ..., D_n, V)
+        logprobs = torch.log_softmax(logits, dim=-1)  # (B, C, H, W, V)
 
         if x_raw is None:
+            # Has an extra dimension for vocab_size.
             return logprobs
         else:
+            # elementwise log prob, same shape as x_raw
             x_one_hot = nn.functional.one_hot(x_raw.long(), num_classes=self.config.model.vocab_size)
-            log_probs = (x_one_hot * logprobs).sum(-1)
+            # Select the correct log probabilities.
+            log_probs = (x_one_hot * logprobs).sum(-1)  # (B, C, H, W)
             return log_probs
 
     def decode_p_x_z_0(self, z_0_latent, method='argmax'):
@@ -1409,7 +1392,12 @@ class UQDM_SD(Diffusion_SD):
         rate = torch.sum(rate, dim=[1, 2, 3])
 
         return z_s, rate
-    
+    def _compute_rate_expected(self, q, p, n_samples=5):
+        rates = torch.stack([
+            torch.sum(-p.log_prob(q.sample()), dim=[1, 2, 3])
+            for _ in range(n_samples)
+        ])
+        return rates.mean(0)
     @torch.no_grad()
     def compute_cost_matrix_uqdm(self, data_iter, seed=None, timestep_stride=100,
                                 num_images=1, cache_path=None):
@@ -1515,10 +1503,8 @@ class UQDM_SD(Diffusion_SD):
                     p = self.p_s_t(p_loc, p_scale, ts_t, ts_s)
                     q = self.q_s_t(q_loc, q_scale)
 
-                    with local_seed(seed, i=i * len(timesteps) + j + img_idx * 10_000_000):
-                        z_s, rate = self.relative_entropy_coding(q, p, compress_mode=None)
-
-                    cost_matrix_img[i, j] = rate.mean().item() * rescale_pixel_to_bpd *3
+                    rate = self._compute_rate_expected(q, p)
+                    cost_matrix_img[i, j] = rate.mean().item() * rescale_pixel_to_bpd * 3
                     # In cost matrix, for just the first consecutive step i=0, j=1:
                     if i == 0 and j == 1:
                         print(f"rate raw (pre-mean): {rate}")          # shape [B]
@@ -1601,8 +1587,7 @@ class UQDM_SD(Diffusion_SD):
                 (alpha_s * sigma2_ts / (alpha_t * sigma_t)) * eps_t
         p_scale = torch.sqrt(sigma2_ts).expand_as(z_t)
         return p_loc, p_scale
-import time
-import numpy as np
+
 def compute_psnr(pred, target, max_val=None):
     """Compute PSNR between pred and target tensors."""
     if max_val is None:
@@ -1611,6 +1596,7 @@ def compute_psnr(pred, target, max_val=None):
     if mse == 0:
         return float('inf')
     return 10 * np.log10((max_val ** 2) / mse)
+import time
 def find_optimal_path_dp(bpp_matrix, timesteps):
     """
     Find optimal transmission path via DP using raw KL-based bpp.
@@ -1626,39 +1612,6 @@ def find_optimal_path_dp(bpp_matrix, timesteps):
     """
     print("Checking KL additivity...")
     T = len(bpp_matrix)
-    max_violation = 0
-    total_triples = 0
-    violated_triples = 0  # count where violation > threshold
-    sum_violation = 0
-    sum_relative_violation = 0
-
-    threshold = 1e-4  # tunable
-
-    # for i in range(T):
-    #     for k in range(i+1, T):
-    #         for j in range(k+1, T):
-    #             direct    = bpp_matrix[i, j]
-    #             via_k     = bpp_matrix[i, k] + bpp_matrix[k, j]
-    #             violation = abs(direct - via_k)
-    #             rel_violation = violation / (via_k + 1e-10)  # relative to path cost
-
-    #             max_violation      = max(max_violation, violation)
-    #             sum_violation     += violation
-    #             sum_relative_violation += rel_violation
-    #             total_triples     += 1
-    #             if violation > threshold:
-    #                 violated_triples += 1
-
-    # mean_violation          = sum_violation / total_triples
-    # mean_relative_violation = sum_relative_violation / total_triples
-    # pct_violated            = 100 * violated_triples / total_triples
-
-    # print(f"Total triples checked : {total_triples}")
-    # print(f"Max violation         : {max_violation:.8f}")
-    # print(f"Mean violation        : {mean_violation:.8f}")
-    # print(f"Mean relative violation: {mean_relative_violation*100:.4f}%")
-    # print(f"Triples with violation > {threshold}: {violated_triples} ({pct_violated:.2f}%)")  # ← insert here
-
     INF = float('inf')
 
     # dp[j] = (min_cost_to_reach_j, predecessor_index)
@@ -1705,47 +1658,7 @@ def find_optimal_path_dp(bpp_matrix, timesteps):
     print(f"  Timestep path       : {timestep_path}")
 
     return optimal_path, timestep_path, bpp_breakdown
-def plot_uqdm_analysis(cost_matrix, timesteps, psnr_per_timestep):
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    T = len(timesteps)
 
-    # --- 1. Cost Matrix Heatmap ---
-    ax1 = axes[0]
-    mask = np.tril(np.ones_like(cost_matrix, dtype=bool))
-    masked = np.ma.masked_where(mask, cost_matrix)
-
-    im = ax1.imshow(masked, aspect='auto', origin='upper', cmap='viridis')
-    plt.colorbar(im, ax=ax1, label='BPP')
-    ax1.set_title('UQDM Cost Matrix (BPP)')
-    ax1.set_xlabel('Target timestep index (j)')
-    ax1.set_ylabel('Source timestep index (i)')
-
-    tick_stride = max(1, T // 10)
-    tick_indices = list(range(0, T, tick_stride))
-    tick_labels  = [str(timesteps[i]) for i in tick_indices]
-    ax1.set_xticks(tick_indices); ax1.set_xticklabels(tick_labels, rotation=45, ha='right', fontsize=8)
-    ax1.set_yticks(tick_indices); ax1.set_yticklabels(tick_labels, fontsize=8)
-
-    # --- 2. PSNR vs Timestep ---
-    ax2 = axes[1]
-    ax2.plot(timesteps, psnr_per_timestep, color='royalblue', linewidth=1.8, marker='o', markersize=3)
-    ax2.set_title('PSNR per Timestep')
-    ax2.set_xlabel('Timestep')
-    ax2.set_ylabel('PSNR (dB)')
-    ax2.invert_xaxis()
-    ax2.grid(True, linestyle='--', alpha=0.4)
-
-    plt.tight_layout()
-    plt.savefig('uqdm_analysis.png', dpi=150, bbox_inches='tight')
-"""
-Memory-efficient compression sweep.
-
-Key changes vs original:
-  1. Images are never all loaded into RAM at once — streamed one-by-one.
-  2. Reconstructions are never saved to disk — activations are computed on-the-fly.
-  3. Real image activations are computed once and cached as a .npz, not as ~10k PNGs.
-  4. FID is computed from cached activation stats, not from image folders.
-"""
 
 import argparse
 import json
@@ -1760,6 +1673,22 @@ from torchvision.utils import save_image
 # pip install clean-fid
 from cleanfid.features import build_feature_extractor
 from cleanfid.fid import frechet_distance
+def compute_psnr(original: np.ndarray, reconstructed: np.ndarray, max_val: float = 255.0) -> float:
+    """
+    Compute Peak Signal-to-Noise Ratio (PSNR) between original and reconstructed images.
+    
+    Args:
+        original: Original image array
+        reconstructed: Reconstructed image array
+        max_val: Maximum pixel value (1.0 for normalized, 255 for uint8)
+    
+    Returns:
+        PSNR value in dB
+    """
+    mse = np.mean((original.astype(np.float64) - reconstructed.astype(np.float64)) ** 2)
+    if mse == 0:
+        return float('inf')
+    return 20 * np.log10(max_val / np.sqrt(mse))
 
 
 # ---------------------------------------------------------------------------
@@ -2015,33 +1944,7 @@ def plot_fid_vs_rate(fid_results: dict, baselines: dict = None, plot_per_step: b
     plt.tight_layout()
     plt.savefig("fid_vs_rate.png", dpi=150)
     plt.show()
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
-def _unwrap_to_tensor(item) -> torch.Tensor:
-    """
-    Accepts a raw Tensor or a nested iterable and returns a (1, C, H, W) Tensor.
-    """
-    if isinstance(item, torch.Tensor):
-        img = item
-    else:
-        # unwrap one level of generator/list
-        for sub in item:
-            if isinstance(sub, torch.Tensor):
-                img = sub
-                break
-        else:
-            raise ValueError(f"Could not extract a Tensor from item: {type(item)}")
-
-    if img.ndim == 3:
-        img = img.unsqueeze(0)          # (C,H,W) → (1,C,H,W)
-    return img
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -2063,81 +1966,7 @@ if __name__ == "__main__":
 
     model = load_checkpoint_SD(config_path=args.config_path, ckpt_path=args.ckpt_path)
     train_iter, eval_iter = load_data_from_folder("data_1/", resolution=512)
-
-    timestep_paths = {
-        "stage_5": [999, 799, 599, 399, 199, 1, 0],
-    }
-
-    results = run_compression_sweep(
-        model=model,
-        eval_iter_fn=lambda: load_data_from_folder("data_1/", resolution=512)[1],
-        timestep_paths=timestep_paths,
-        out_root="/home/lu/Documents/uqdm/fid_sweep"
-    )
-
-    with open("/home/lu/Documents/uqdm/fid_results.json", "w") as f:
-        json.dump(results, f, indent=2)
-    print("Saved fid_results.json")
-
-    # plot_fid_vs_rate(results)
-    # resolutions = [64, 256,512]
-    # results = {}
-
-    # for res in resolutions:
-    #     print(f"\n=== Evaluating resolution {res} ===")
-
-    #     if res == 64:
-    #         train_iter, eval_iter = load_data('ImageNet64', model.config.data)
-    #     else:
-    #         train_iter, eval_iter = load_data_from_folder('data_1/', resolution=res)
-
-    #     bpps, psnrs = model.evaluate(eval_iter, n_batches=5, seed=seed, timestep_path=None)
-    #     results[res] = {
-    #         'bpps': np.array(bpps),
-    #         'psnrs': np.array(psnrs)
-    #     }
-
-
-    # # Plot
-    # from scipy.ndimage import uniform_filter1d
-
-    # line_styles = {64: '-', 256: '--', 512: ':'}
-    # colors      = {64: 'orange', 256: 'steelblue', 512: 'green'}
-
-    # fig, ax = plt.subplots(figsize=(10, 6))
-    # for res in resolutions:
-    #     bpps   = results[res]['bpps']
-    #     psnrs  = uniform_filter1d(results[res]['psnrs'], size=20)
-    #     ax.plot(
-    #         bpps, psnrs,
-    #         line_styles[res],
-    #         label=f'UQDM-SD {res}×{res}',
-    #         linewidth=1,
-    #         color=colors[res]
-    #     )
-    #     with open(f'uqdm_sd_rd_data_{res}x{res}.txt', 'w') as f:
-    #         f.write(f'# UQDM-SD Rate-Distortion Data ({res}x{res})\n')
-    #         f.write('# Row 1: BPP, Row 2: PSNR (dB)\n')
-    #         f.write(' '.join(f'{bpp:.6f}' for bpp in bpps) + '\n')
-    #         f.write(' '.join(f'{psnr:.6f}' for psnr in psnrs) + '\n')
-    #     print(f"Saved R-D data to uqdm_sd_rd_data_{res}x{res}.txt")
-
-    # ax.set_xlabel('Rate (BPP)', fontsize=13)
-    # ax.set_ylabel('PSNR (dB)', fontsize=13)
-    # ax.set_title('UQDM-SD: Rate-Distortion Curve (Multi-Resolution)', fontsize=14)
-    # ax.legend(fontsize=12, loc='lower right')
-    # ax.grid(True, alpha=0.3)
-    # plt.tight_layout()
-    # plt.savefig('uqdm_sd_rd_curve_multiresolution.png', dpi=150, bbox_inches='tight')
-    # print("Saved plot to uqdm_sd_rd_curve_multiresolution.png")
-
-    # Compress one image
-    # Compress one image
-
-
- 
-    # import matplotlib.pyplot as plt
-    # import numpy as np
+    seed=0
 
     if args.mode == 'train':
         timesteps = model.sd_scheduler.timesteps.cpu().numpy()
@@ -2161,46 +1990,8 @@ if __name__ == "__main__":
         plt.tight_layout()
         plt.savefig('noise_schedule.png')
         plt.show()
-        # model.trainer(train_iter, eval_iter)
+        model.trainer(train_iter, eval_iter)
  
     elif args.mode == 'eval':
 
         os.makedirs(args.save_dir, exist_ok=True)
-
-   
- 
-
-        # # Save original
-        # plt.imsave(
-        #     os.path.join(args.save_dir, 'original.png'),
-        #     img_original.permute(1, 2, 0).numpy()
-        # )
-
-        # # Save each reconstruction
-        # for rank in range(len(reconstructions)):
-        #     img = reconstructions[rank].squeeze().clamp(0, 1)
-        #     plt.imsave(
-        #         os.path.join(args.save_dir, f'recon_{rank:04d}.png'),
-        #         img.permute(1, 2, 0).numpy()
-        #     )
-
-        # print(f'Saved original + {len(reconstructions)} reconstructions to {args.save_dir}/')
-        # cost_matrix, timesteps, psnr_per_timestep = model.compute_cost_matrix_uqdm(
-        #     iter(train_iter), seed=args.seed, timestep_stride=1, num_images=1, cache_path=""
-        # )
-        # plot_uqdm_analysis(cost_matrix, timesteps, psnr_per_timestep)
-        # consecutive_bpp = sum(cost_matrix[i, i+1] for i in range(len(timesteps)-1))
-        # print(f"Cost matrix consecutive bpp: {consecutive_bpp:.4f}")
-        # print(f"Evaluate bpp:                1.75")  
-        # print(f"Num timesteps in matrix:     {len(timesteps)}")
-        # print(f"Timesteps sample:            {timesteps[:5]}...{timesteps[-5:]}")
-        # print(f"Non-zero entries:            {(cost_matrix > 0).sum()}")
-
-        # # Also print per-step to see where the cost concentrates
-        # step_costs = [cost_matrix[i, i+1] for i in range(len(timesteps)-1)]
-        # print(f"Mean per-step bpp:           {np.mean(step_costs):.6f}")
-        # print(f"Max per-step bpp:            {np.max(step_costs):.6f}  at step {np.argmax(step_costs)}")
-        # print(f"Steps with bpp > 0.01:       {sum(c > 0.01 for c in step_costs)}")
-        # optimal_path, path_timesteps, breakdown = find_optimal_path_dp(cost_matrix, timesteps)
-        # print(f"{breakdown['optimal_total_bpp']:.6f} bpp", breakdown['consecutive_bpp'])
-        # print(f"{breakdown['num_transitions']:.2f} transitions  ", breakdown['saving_bpp'])
