@@ -1995,3 +1995,20 @@ if __name__ == "__main__":
     elif args.mode == 'eval':
 
         os.makedirs(args.save_dir, exist_ok=True)
+        timesteps = None
+        bpps, psnrs = model.evaluate(eval_iter, n_batches=100, seed=seed, timestep_path=timesteps)
+        bpps = np.array(bpps)
+        psnrs = np.array(psnrs)
+
+        # Save to txt
+        np.savetxt('uqdm.txt', np.column_stack([bpps, psnrs]), header='bpp psnr', fmt='%.6f')
+
+        # Save plot as png
+        plt.figure()
+        plt.plot(bpps, psnrs, 'o-')
+        plt.xlabel('BPP')
+        plt.ylabel('PSNR (dB)')
+        plt.title('Rate-Distortion Curve')
+        plt.grid(True)
+        plt.savefig('uqdm.png', dpi=150, bbox_inches='tight')
+        plt.close()
