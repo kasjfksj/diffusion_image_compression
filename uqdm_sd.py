@@ -304,10 +304,10 @@ def load_data_from_folder(folder_path='data_1/', resolution=512):
                 transforms.Lambda(lambda x: (x * 255).byte()),  # convert to [0, 255] uint8
             ])
             self.image_paths = (
-                list(self.folder_path.glob('*.jpg')) +
-                list(self.folder_path.glob('*.png')) +
-                list(self.folder_path.glob('*.jpeg')) +
-                list(self.folder_path.glob('*.JPEG'))
+                list(self.folder_path.rglob('*.jpg')) +
+                list(self.folder_path.rglob('*.png')) +
+                list(self.folder_path.rglob('*.jpeg')) +
+                list(self.folder_path.rglob('*.JPEG'))
             )
 
         def __len__(self):
