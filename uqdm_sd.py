@@ -1071,51 +1071,36 @@ class Diffusion_SD(torch.nn.Module):
                                 recon_method=recon_method, seed=0, timestep_path=timestep_path)
         return metrics['prog_x_hats']
 
-    def log_probs_x_z0(self, z_0, x_raw=None):
+    def log_probs_x_z0(self, z_0_latent, x_raw=None):
         """
-        Computes log p(x_raw | z_0), under the Gaussian approximation of q(z_0|x) introduced in VDM, section 3.3.
-        If `x_raw` is not provided, this method computes the log probs of every
-        possible value of x_raw under a factorized categorical distribution; otherwise,
-        it will evaluate the log probs of the given `x_raw`.
-
-        Internally we compute p(x_i | z_0i), with i = pixel index, for all possible values
-        of x_i in the vocabulary. We approximate this with q(z_0i | x_i).
-        Un-normalized logits are: -1/2 SNR_0 (z_0 / alpha_0 - k)^2
-        where k takes all possible x_i values. Logits are then normalized to logprobs.
-
-        If `x_raw` is None, the method returns a tensor of shape (B, C, H, W,
-        vocab_size) containing, for each pixel, the log probabilities for all
-        `vocab_size` possible values of that pixel. The output sums to 1 over
-        the last dimension. Otherwise, we will select the log probs of the given `x_raw`.
-
-        Inputs:
-        -------
-        z_0   - z_0 to be decoded, shape (B, C, H, W).
-        x_raw - Input uint8 image, shape (B, C, H, W).
-
-        Returns:
-        --------
-        log_probs - Log probabilities [B, C, H, W, vocab_size] if `x_raw` is None else [B, C, H, W]
+        Decode z_0_latent and compute pixel probabilities
+        z_0_latent: [B, 4, H/8, W/8]
         """
-        gamma_0 = self.gamma(torch.tensor([0.0], device=device))
-        z_0_rescaled = z_0 / torch.sqrt(torch.sigmoid(-gamma_0))
-        # Compute a tensor of log p(x | z) for all possible values of x.
-        # Logits are exact if there are no dependencies between dimensions of x
+        # Decode latent to pixel space
+        with torch.no_grad():
+            z_0_pixel = self.vae.decode(z_0_latent / self.vae_scale_factor).sample
+
+        gamma_0 = self.gamma(torch.tensor([0], device=device))
+
+        z_0_rescaled = z_0_pixel / torch.sqrt(torch.sigmoid(-gamma_0))
+
+
         x_vals = torch.arange(self.config.model.vocab_size, device=z_0_rescaled.device)
+
         x_vals = 2 * ((x_vals + .5) / self.config.model.vocab_size) - 1
         x_vals = torch.reshape(x_vals, [1] * z_0_rescaled.ndim + [-1])
-        z = z_0_rescaled.unsqueeze(-1)  # (B, D1, ..., D_n) -> (B, D1, ..., D_n, 1) for broadcasting
-        logits = -0.5 * torch.exp(-gamma_0) * (z - x_vals) ** 2  # (B, D1, ..., D_n, V)
-        logprobs = torch.log_softmax(logits, dim=-1)  # (B, C, H, W, V)
+
+        z = z_0_rescaled.unsqueeze(-1)
+
+        logits = -0.5 * torch.exp(-gamma_0) *  (z - x_vals) ** 2
+
+        logprobs = torch.log_softmax(logits, dim=-1)
 
         if x_raw is None:
-            # Has an extra dimension for vocab_size.
             return logprobs
         else:
-            # elementwise log prob, same shape as x_raw
             x_one_hot = nn.functional.one_hot(x_raw.long(), num_classes=self.config.model.vocab_size)
-            # Select the correct log probabilities.
-            log_probs = (x_one_hot * logprobs).sum(-1)  # (B, C, H, W)
+            log_probs = (x_one_hot * logprobs).sum(-1)
             return log_probs
 
     def decode_p_x_z_0(self, z_0_latent, method='argmax'):
@@ -1957,6 +1942,7 @@ if __name__ == "__main__":
     parser.add_argument("--recon_method",
                         choices=["ancestral", "flow_based", "denoise"],
                         default="ancestral")
+    parser.add_argument("--data", default="data_1/")
     args = parser.parse_args()
 
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
@@ -1965,7 +1951,7 @@ if __name__ == "__main__":
     torch.use_deterministic_algorithms(True)
 
     model = load_checkpoint_SD(config_path=args.config_path, ckpt_path=args.ckpt_path)
-    train_iter, eval_iter = load_data_from_folder("data_1/", resolution=512)
+    train_iter, eval_iter = load_data_from_folder(args.data, resolution=512)
     seed=0
 
     if args.mode == 'train':
