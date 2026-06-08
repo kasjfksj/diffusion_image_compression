@@ -321,16 +321,15 @@ def load_data_from_folder(folder_path='data_1/', resolution=512):
             return image
 
     full_dataset = ImageFolderFlat(folder_path)
-    full_dataset = torch.utils.data.Subset(full_dataset, range(100))
 
     total_size = len(full_dataset)
-    train_size = 1
+    train_size = int(0.9 * total_size)
     eval_size = total_size - train_size
     train_data, eval_data = random_split(full_dataset, [train_size, eval_size])
 
     train_iter = DataLoader(train_data, batch_size=32, shuffle=True,
                             pin_memory=True, num_workers=0)
-    eval_iter = DataLoader(eval_data, batch_size=1, shuffle=False,
+    eval_iter = DataLoader(eval_data, batch_size=32, shuffle=False,
                            pin_memory=True, num_workers=0)
 
     train_iter = cycle(train_iter)
