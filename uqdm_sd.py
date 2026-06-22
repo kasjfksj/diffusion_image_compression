@@ -1,25 +1,15 @@
-from networkx import config
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, default_collate
 from torch.distributions import constraints, TransformedDistribution, SigmoidTransform, AffineTransform
 from torch.distributions import Normal, Uniform
 from torch.distributions.kl import kl_divergence
-from safetensors.torch import load_file
 from diffusers import UNet2DConditionModel, DDPMScheduler
-# For compression to bits only
-from torchvision.utils import save_image
-
+from peft import LoraConfig
 from tensorflow_compression.python.ops import gen_ops
 import tensorflow as tf
-import matplotlib.pylab as plt
-import argparse
-import numpy as np
-import torch
 import matplotlib.pyplot as plt
-import torchvision.utils as vutils
-from itertools import islice
-from ml_collections import ConfigDict
+import argparse
 import numpy as np
 import json
 import os
@@ -27,6 +17,14 @@ from pathlib import Path
 from contextlib import contextmanager
 import zipfile
 from tqdm import tqdm
+from itertools import islice
+from ml_collections import ConfigDict
+import math
+import time
+
+from torch.utils.data import Subset, random_split
+from torchvision import transforms
+from PIL import Image
 
 device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
 
@@ -40,12 +38,29 @@ def softplus_inverse(x):
     import math
     import numpy as np
     return math.log(np.expm1(x))
+
+
 class SD15ScoreNet(torch.nn.Module):
+    """
+    SD1.5 UNet + LoRA, with variance prediction implemented VDM-Net style:
+    the shared trunk's own conv_out is widened to emit eps + scale jointly,
+    rather than using a separate side-head.
+    """
+
+    @staticmethod
+    def softplus_inverse(x):
+        import math
+        import numpy as np
+        return math.log(np.expm1(x))
+
+    def softplus_init1(self, x):
+        return torch.nn.functional.softplus(x + self.SOFTPLUS_INV1)
+
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.mcfg = config.model
-        self.SOFTPLUS_INV1 = softplus_inverse(1.0)
+        self.SOFTPLUS_INV1 = self.softplus_inverse(1.0)
 
         self.unet = UNet2DConditionModel.from_pretrained(
             "runwayml/stable-diffusion-v1-5",
@@ -56,34 +71,43 @@ class SD15ScoreNet(torch.nn.Module):
             subfolder="scheduler"
         )
 
-        # Scale head takes the penultimate UNet latent (320 channels from conv_in path)
-        # SD1.5 UNet final conv_out goes from 320 -> 4, so we hook before it
-        penultimate_channels = self.unet.conv_out.in_channels  # typically 320
-        self.scale_head = nn.Sequential(
-            nn.Conv2d(penultimate_channels, 64, kernel_size=1),
-            nn.SiLU(),
-            nn.Conv2d(64, 4, kernel_size=1),
-        ).cuda()
+        # --- Freeze the base UNet, then inject LoRA into the trunk's attention ---
+        self.unet.requires_grad_(False)
 
-        # # Zero-init the last layer for stable training start
-        nn.init.kaiming_normal_(self.scale_head[0].weight, mode='fan_out', nonlinearity='relu')
-        nn.init.zeros_(self.scale_head[0].bias)
-        nn.init.xavier_normal_(self.scale_head[-1].weight, gain=0.01)  # small but non-zero
-        nn.init.zeros_(self.scale_head[-1].bias)
+        lora_rank = getattr(self.mcfg, "lora_rank", 16)
+        lora_alpha = getattr(self.mcfg, "lora_alpha", 16)
+        lora_config = LoraConfig(
+            r=lora_rank,
+            lora_alpha=lora_alpha,
+            init_lora_weights="gaussian",
+            target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+        )
+        self.unet.add_adapter(lora_config)
 
-        self._penultimate_latent = None
-        self._register_penultimate_hook()
+        # --- Widen conv_out to emit eps (4ch) + scale logits (4ch), VDM-style ---
+        self.n_channels = self.unet.conv_out.out_channels  # 4
+        in_ch = self.unet.conv_out.in_channels             # 320
+        old_conv_out = self.unet.conv_out
 
-    def _register_penultimate_hook(self):
-        """Hook the layer immediately before conv_out to capture its output."""
-        def hook_fn(module, input, output):
-            # input[0] is the tensor fed into conv_out — the penultimate latent
-            self._penultimate_latent = input[0]
+        new_conv_out = nn.Conv2d(
+            in_ch, self.n_channels * 2, kernel_size=3, padding=1,
+            dtype=old_conv_out.weight.dtype, device=old_conv_out.weight.device,
+        )
+        with torch.no_grad():
+            # First half: copy pretrained eps-prediction weights verbatim.
+            new_conv_out.weight[: self.n_channels].copy_(old_conv_out.weight)
+            new_conv_out.bias[: self.n_channels].copy_(old_conv_out.bias)
+            # Second half: zero-init, so scale logits start at 0 ->
+            # softplus_init1(0) == 1, matching VDM_Net's zero_init behaviour.
+            nn.init.zeros_(new_conv_out.weight[self.n_channels:])
+            nn.init.zeros_(new_conv_out.bias[self.n_channels:])
 
-        self.unet.conv_out.register_forward_hook(hook_fn)
+        self.unet.conv_out = new_conv_out
+        # This is a fresh layer with no pretrained prior worth preserving via
+        # LoRA's low-rank constraint — train it directly, full-rank.
+        self.unet.conv_out.requires_grad_(True)
 
-    def softplus_init1(self, x):
-        return torch.nn.functional.softplus(x + self.SOFTPLUS_INV1)
+        self.unet.train()
 
     def forward(self, z, g_t):
         g_t = g_t.expand(z.shape[0])
@@ -95,17 +119,30 @@ class SD15ScoreNet(torch.nn.Module):
 
         null_cond = torch.zeros(z.shape[0], 77, 768, device=z.device, dtype=z.dtype)
 
-        # UNet forward — no grad for the UNet weights, but hook captures the
-        # penultimate latent so scale_head can still receive gradients through it
-        with torch.no_grad():
-            eps_hat = self.unet(z, timesteps, encoder_hidden_states=null_cond).sample
+        # No no_grad — LoRA params and the new conv_out need a live graph.
+        h = self.unet(z, timesteps, encoder_hidden_states=null_cond).sample  # (B, 8, H, W)
 
-        # _penultimate_latent was captured inside the no_grad block, so we must
-        # re-enable grad for the scale_head branch
-        penultimate = self._penultimate_latent
+        eps_hat, scale_logits = torch.split(h, self.n_channels, dim=1)
+        pred_scale_factors = self.softplus_init1(scale_logits)
 
-        pred_scale_factors = self.softplus_init1(self.scale_head(penultimate))
+        # SD1.5's native parameterization already predicts epsilon directly
+        # (unlike VDM_Net's residual "+z"), so no extra add is needed here.
         return eps_hat, pred_scale_factors
+
+    def trainable_parameters(self):
+        return [p for p in self.unet.parameters() if p.requires_grad]
+
+    def save_adapter(self, path):
+        # Saves LoRA weights. The widened conv_out isn't a LoRA layer, so
+        # save it separately if you want to reload it later.
+        self.unet.save_lora_adapter(path)
+        torch.save(self.unet.conv_out.state_dict(), f"{path}/conv_out.pt")
+
+    def load_adapter(self, path):
+        self.unet.load_lora_adapter(path)
+        self.unet.conv_out.load_state_dict(torch.load(f"{path}/conv_out.pt"))
+
+
 class ExponentialMovingAverage:
     """
     Maintains (exponential) moving average of a set of parameters.
@@ -223,7 +260,6 @@ class ToIntTensor:
         )
         return image
 
-from torch.utils.data import Subset
 
 class NPZLoader(Dataset):
     """
@@ -240,12 +276,6 @@ class NPZLoader(Dataset):
         self.batch_lens = [self.npz_len(f) for f in self.files]
         self.anchors = np.cumsum([0] + self.batch_lens)
         self.removed_idxs = [[] for _ in range(len(self.files))]
-        # if not train and remove_duplicates:
-        #     removed = np.load(os.path.join(path, 'val_data.npz'))
-        #     self.removed_idxs = [
-        #         removed[(removed >= self.anchors[i]) & (removed < self.anchors[i + 1])] - self.anchors[i] for i in
-        #         range(len(self.files))]
-        #     self.anchors -= np.cumsum([0] + [np.size(r) for r in self.removed_idxs])
         self.transform = transform
         self.cache_fid = None
         self.cache_npy = None
@@ -274,7 +304,6 @@ class NPZLoader(Dataset):
         return self.cache_npy
 
     def __len__(self):
-        # return sum(self.batch_lens)
         return self.anchors[-1]
 
     def __getitem__(self, idx):
@@ -285,10 +314,7 @@ class NPZLoader(Dataset):
             torch_array = self.transform(numpy_array)
         return torch_array
 
-from torch.utils.data import Dataset, DataLoader, random_split
-from torchvision import transforms
-from PIL import Image
-from torch.utils.data import Subset
+
 def load_data_from_folder(folder_path='data_1/', resolution=512):
     """
     Load images from a folder and split into train (90%) and eval (10%) sets.
@@ -304,10 +330,10 @@ def load_data_from_folder(folder_path='data_1/', resolution=512):
                 transforms.Lambda(lambda x: (x * 255).byte()),  # convert to [0, 255] uint8
             ])
             self.image_paths = (
-                list(self.folder_path.rglob('*.jpg')) +
-                list(self.folder_path.rglob('*.png')) +
-                list(self.folder_path.rglob('*.jpeg')) +
-                list(self.folder_path.rglob('*.JPEG'))
+                list(self.folder_path.glob('*.jpg')) +
+                list(self.folder_path.glob('*.png')) +
+                list(self.folder_path.glob('*.jpeg')) +
+                list(self.folder_path.glob('*.JPEG'))
             )
 
         def __len__(self):
@@ -335,6 +361,8 @@ def load_data_from_folder(folder_path='data_1/', resolution=512):
     train_iter = cycle(train_iter)
 
     return train_iter, eval_iter
+
+
 def load_data(dataspec, cfg):
     """
     Load datasets, with finite eval set and infinitely looping training set
@@ -345,12 +373,10 @@ def load_data(dataspec, cfg):
     if dataspec in ['ImageNet64']:
         train_data, eval_data = [NPZLoader(DATASET_PATH[dataspec], train=mode, transform=ToIntTensor()) for mode in
                                  [True, False]]
-    # elif:   # Add more datasets here
-    
+
     # Limit to only 5 data points
     train_data = Subset(train_data, range(min(5, len(train_data))))
     eval_data = Subset(eval_data, range(min(5, len(eval_data))))
-    # print("asdfs",len(train_data))
     train_iter, eval_iter = [DataLoader(d, batch_size=cfg.batch_size, shuffle=cfg.get('shuffle', False),
                                         pin_memory=cfg.get('pin_memory', True), num_workers=cfg.get('num_workers', 1))
                              for d in [train_data, eval_data]]
@@ -367,9 +393,6 @@ def load_checkpoint_SD(config_path=None, ckpt_path=None):
     ------
     config_path: path to a folder containing config.json. If None, uses default config.
     ckpt_path:   path to a .pt file containing scale_head weights. If None, uses random init.
-
-    Examples:
-
     """
     if config_path is not None:
         with open(os.path.join(config_path, 'config.json'), 'r') as f:
@@ -384,6 +407,7 @@ def load_checkpoint_SD(config_path=None, ckpt_path=None):
         model.load(ckpt_path)
 
     return model
+
 
 """
 UQDM: Diffusion model, Distributions, Entropy Coding, UQDM
@@ -492,7 +516,6 @@ class UniformNoisyDistribution(torch.distributions.Distribution):
     """
 
     arg_constraints = {}
-    # arg_constraints = {"delta": torch.distributions.constraints.nonnegative}
 
     def __init__(self, base_dist, delta):
         super().__init__()
@@ -526,7 +549,6 @@ class UniformNoisyDistribution(torch.distributions.Distribution):
         return OverflowCategorical(logits=logits, L=L, R=R)
 
     def log_prob(self, y):
-        # return torch.log(self.base_dist.cdf(y + self.half) - self.base_dist.cdf(y - self.half)) - self.log_delta
         if not hasattr(self.base_dist, "log_cdf"):
             raise NotImplementedError(
                 "`log_prob()` is not implemented unless the base distribution implements `log_cdf()`.")
@@ -609,37 +631,45 @@ class EntropyModel:
         self.prior_shape = self.prior.probs.shape[:-1]
         self.precision = range_coder_precision
 
-        # Build quantization tables
+        # Build quantization tables — stay on CPU throughout
         total = 2 ** self.precision
-        probs = self.prior.probs.reshape(-1, self.prior.probs.shape[-1])
+        probs = self.prior.probs.reshape(-1, self.prior.probs.shape[-1]).cpu().float()
         quantized_pdf = torch.round(probs * total).to(torch.int32)
         quantized_pdf = torch.clip(quantized_pdf, min=1)
 
-        # Normalize pdf so that sum pmf_i = 2 ** precision
+        # Normalize: reduce overflowing rows
         while True:
-            mask = quantized_pdf.sum(dim=-1) > total
+            sums = quantized_pdf.sum(dim=-1)
+            mask = sums > total
             if not mask.any():
                 break
-            # m * (log2(v) - log2(v-1))
             penalty = probs[mask] * (torch.log2(1 + 1 / (quantized_pdf[mask] - 1)))
-            # inf if v = 1 as intended but handle nan if also pmf = 0
             idx = penalty.nan_to_num(torch.inf).argmin(dim=-1)
-            quantized_pdf[mask, idx] -= 1
+            quantized_pdf[mask] -= torch.zeros_like(quantized_pdf[mask]).scatter_(
+                1, idx.unsqueeze(1), 1
+            )
+
+        # Normalize: increase underflowing rows
         while True:
-            mask = quantized_pdf.sum(axis=-1) < total
+            sums = quantized_pdf.sum(dim=-1)
+            mask = sums < total
             if not mask.any():
                 break
-            # m * (log2(v+1) - log2(v))
             penalty = probs[mask] * (torch.log2(1 + 1 / quantized_pdf[mask]))
             idx = penalty.argmax(dim=-1)
-            quantized_pdf[mask, idx] += 1
+            quantized_pdf[mask] += torch.zeros_like(quantized_pdf[mask]).scatter_(
+                1, idx.unsqueeze(1), 1
+            )
 
         quantized_cdf = torch.cumsum(quantized_pdf, dim=-1)
+
+        # Keep everything on CPU — compress/decompress call .cpu() anyway
         self.quantized_cdf = torch.cat([
-            - self.precision * torch.ones((quantized_pdf.shape[0], 1), device=device),
-            torch.zeros((quantized_pdf.shape[0], 1), device=device),
-            quantized_cdf
+            -self.precision * torch.ones((quantized_pdf.shape[0], 1), dtype=torch.float32),
+            torch.zeros((quantized_pdf.shape[0], 1), dtype=torch.float32),
+            quantized_cdf.float()
         ], dim=-1).reshape(-1)
+
         self.indexes = torch.arange(quantized_pdf.shape[0], dtype=torch.int32)
         self.offsets = self.prior.L if type(self.prior) is OverflowCategorical else 0
 
@@ -651,7 +681,7 @@ class EntropyModel:
         codec = gen_ops.create_range_encoder([], self.quantized_cdf.cpu())
         codec = gen_ops.entropy_encode_index(codec, self.indexes.cpu(), x)
         bits = gen_ops.entropy_encode_finalize(codec).numpy()
-        
+
         return bits
 
     def decompress(self, bits):
@@ -662,9 +692,9 @@ class EntropyModel:
         bits = tf.convert_to_tensor(bits, dtype=tf.string)
         codec = gen_ops.create_range_decoder(bits, self.quantized_cdf.cpu())
         codec, x = gen_ops.entropy_decode_index(codec, self.indexes.cpu(), self.indexes.shape, tf.int32)
-        # sanity = gen_ops.entropy_decode_finalize(codec)
         x = torch.from_numpy(x.numpy()).reshape(self.prior_shape).to(device).to(torch.float32) + self.offsets
         return x
+
 
 def decode_and_save(z_t, eps_hat, alpha_t, sigma_t, vae, vae_scale_factor=0.18215):
     # Compute clean latent
@@ -681,8 +711,11 @@ def decode_and_save(z_t, eps_hat, alpha_t, sigma_t, vae, vae_scale_factor=0.1821
 
     alpha_str = f"{alpha_t.flatten()[0].item():.3f}"
     Image.fromarray(x_pixel).save(f"image_{alpha_str}.png")
-import math
+
+
 CHECKPOINT_DIR = 'checkpoints/uqdm-sd'
+
+
 class Diffusion_SD(torch.nn.Module):
     """
     Progressive Compression with Gaussian Diffusion in LATENT SPACE.
@@ -712,19 +745,19 @@ class Diffusion_SD(torch.nn.Module):
         # Score network with frozen UNet backbone
         self.score_net = SD15ScoreNet(self.config)
 
-        # Optimizer and EMA scoped to scale_head only — frozen UNet is never updated
+        # Optimizer and EMA scoped to trainable LoRA + conv_out params only — frozen UNet is never updated
+        scale_params = [p for p in self.score_net.unet.parameters() if p.requires_grad]
+
         self.optimizer = torch.optim.Adam(
-            self.score_net.scale_head.parameters(),
+            scale_params,
             lr=self.config.optim.lr,
             weight_decay=self.config.optim.get('weight_decay', 0.0),
         )
         self.ema = ExponentialMovingAverage(
-            self.score_net.scale_head.parameters(),
+            scale_params,
             decay=self.config.optim.get('ema_decay', 0.9999),
         )
 
-
-        # ← NO self.gamma = get_noise_schedule() here, we use the method below instead
     def gamma(self, t):
         """Log-SNR at integer SD timestep t in [0, 999]."""
         alpha_bar = self.alphas_cumprod[t]
@@ -739,19 +772,17 @@ class Diffusion_SD(torch.nn.Module):
 
     def alpha(self, t):
         return torch.sqrt(self.alphas_cumprod[t])
-    
+
     def q_t(self, x_latent, t=1):
         # q(z_t | x_latent) = N(alpha_t * x_latent, sigma^2_t)
-        # Now x_latent is in latent space [B, 4, H/8, W/8]
+        # x_latent is in latent space [B, 4, H/8, W/8]
         return Normal(loc=self.alpha(t) * x_latent, scale=self.sigma(t))
 
     def p_1(self):
         # p(z_1) = N(0, 1) - still works in latent space
         return Normal(torch.tensor(0.0).to(device), torch.tensor(1.0).to(device))
 
-    # These remain unchanged
     def p_s_t(self, p_loc, p_scale, t, s):
-        # print(p_scale[0][0][0])
         if self.config.model.prior_type == 'logistic':
             base_dist = LogisticDistribution(loc=p_loc, scale=p_scale * np.sqrt(3. / np.pi ** 2))
         elif self.config.model.prior_type in ('gaussian', 'normal'):
@@ -768,9 +799,10 @@ class Diffusion_SD(torch.nn.Module):
 
     def relative_entropy_coding(self, q, p, compress_mode=None):
         raise NotImplementedError
+
     def get_s_t_params(self, z_t, t, s, x_latent=None, clip_denoised=True, cache_denoised=False, deterministic=False):
         """
-        Now works in LATENT SPACE.
+        Works in LATENT SPACE.
         z_t: [B, 4, H/8, W/8] noisy latent
         x_latent: [B, 4, H/8, W/8] clean latent (if provided)
         """
@@ -781,28 +813,20 @@ class Diffusion_SD(torch.nn.Module):
 
         if x_latent is None:
             # Predict noise using score network
-            if self.config.model.get('learned_prior_scale'):
-                eps_hat, pred_scale_factors = self.score_net(z_t, gamma_t)
-            else:
-                eps_hat,_  = self.score_net(z_t, gamma_t)
-            
+            eps_hat, pred_scale_factors = self.score_net(z_t, gamma_t)
+
             # Compute denoised prediction in LATENT space
             if clip_denoised or cache_denoised:
-
                 x_latent = (z_t - sigma_t * eps_hat) / alpha_t  # Still in latent space
-
-                # decode_and_save(z_t, eps_hat, alpha_t, sigma_t, self.vae, self.vae_scale_factor)
 
             if clip_denoised:
                 # Clip in latent space (less aggressive than [-1,1])
                 x_latent.clamp_(-4.0, 4.0)  # Latents can have larger range
-            
+
             if cache_denoised:
                 self.denoised = x_latent
-         
+
             scale = sigma_s * torch.sqrt(expm1_term)
-            # print(expm1_term.flatten()[0].item(), t)
-            # print(scale.shape, scale.max(), scale.min())
 
             if self.config.model.get('base_prior_scale', 'forward_kernel') == 'forward_kernel':
                 scale = sigma_t * torch.sqrt(expm1_term)
@@ -825,13 +849,12 @@ class Diffusion_SD(torch.nn.Module):
 
         return loc, scale
 
-    def transmit_q_s_t(self, x_latent, z_t, t, s, compress_mode=None, cache_denoised=False,x_raw=None):
-        """Now x_latent is in latent space"""
+    def transmit_q_s_t(self, x_latent, z_t, t, s, compress_mode=None, cache_denoised=False, x_raw=None):
+        """x_latent is in latent space"""
         p_loc, p_scale = self.get_s_t_params(z_t, t, s, cache_denoised=cache_denoised)
         q_loc, q_scale = self.get_s_t_params(z_t, t, s, x_latent=x_latent)
         p_s_t = self.p_s_t(p_loc, p_scale, t, s)
         q_s_t = self.q_s_t(q_loc, q_scale)
-                        # In transmit_q_s_t i=0:
 
         z_s, rate = self.relative_entropy_coding(q_s_t, p_s_t, compress_mode=compress_mode)
 
@@ -847,16 +870,13 @@ class Diffusion_SD(torch.nn.Module):
         if compress_mode == 'decode':
             x_raw = self.entropy_decode(self.compress_bits.pop(0), p)
         elif compress_mode == 'encode':
-            print(123)
             self.compress_bits += [self.entropy_encode(x_raw, p)]
         return x_raw
-
-    
 
     @torch.no_grad()
     def sample(self, init_z=None, shape=None, times=None, deterministic=False,
             clip_samples=False, decode_method='argmax', return_hist=False):
-        
+
         from diffusers import DDIMScheduler
         scheduler = DDIMScheduler.from_pretrained(
             "stable-diffusion-v1-5/stable-diffusion-v1-5",
@@ -903,8 +923,9 @@ class Diffusion_SD(torch.nn.Module):
         if return_hist:
             return x_raw, samples + [x_raw]
         return x_raw
+
     def forward(self, x_raw, z_1=None, recon_method=None, compress_mode=None, seed=None, timestep_path=None):
-        print("___________________")
+
         x_pixel = 2 * ((x_raw.float() + .5) / self.config.model.vocab_size) - 1
         with torch.no_grad():
             x_latent = self.vae.encode(x_pixel).latent_dist.sample() * self.vae_scale_factor
@@ -937,7 +958,6 @@ class Diffusion_SD(torch.nn.Module):
             rand_idx  = torch.randint(0, total_steps, (1,)).item()
             ts_t      = sd_timesteps[rand_idx].item()
             ts_s      = sd_timesteps[rand_idx + 1].item()
-
             q_t_dist  = self.q_t(x_latent, t=ts_t)
             with local_seed(seed, i=rand_idx + 1):
                 z_t   = q_t_dist.sample()
@@ -954,12 +974,11 @@ class Diffusion_SD(torch.nn.Module):
             # Scale by total_steps: single-sample unbiased estimator of the full sum
             loss_diff = rate_one_step * total_steps
 
-        else:       
+        else:
             # Eval: full sequential loop
             z_s       = z_1
             loss_diff = 0.
             metrics   = []
-            _nan_rate = torch.full((x_latent.shape[0],), float('nan'))
             prev_rate = loss_prior  # mirrors original: rate_t = rate_s = loss_prior at start
 
             for i in range(total_steps):
@@ -1003,20 +1022,22 @@ class Diffusion_SD(torch.nn.Module):
         loss       = bpd_latent + bpd_diff + bpd_recon
 
         if torch.is_inference_mode_enabled() and recon_method is not None:
-            # mirrors original: rate_s (last step) + decode from clean z_0
             x_hat_final = (self.decode_p_x_z_0(z_0_latent, method='sample')
                         if recon_method == 'ancestral'
                         else self.decode_p_x_z_0(z_0_latent, method='argmax'))
+
+            # Entry 2: final diffusion step rate + reconstruction from z_0
             metrics += [{
-                'prog_bpds':   prev_rate.cpu() * rescale_pixel_to_bpd,  # last step's rate
+                'prog_bpds':   rate_s.cpu() * rescale_pixel_to_bpd,
                 'prog_x_hats': x_hat_final.detach().cpu(),
                 'prog_mses':   torch.mean((x_hat_final - x_raw).float()**2, dim=[1,2,3]).cpu(),
             }]
-            # mirrors original: loss_recon + ground truth
+
+            # Entry 3: reconstruction loss + ground truth
             metrics += [{
-                'prog_bpds':   loss_recon.cpu() * rescale_pixel_to_bpd,
+                'prog_bpds':   loss_recon.cpu() * rescale_pixel_to_bpd,  # real entropy cost
                 'prog_x_hats': x_raw.cpu(),
-                'prog_mses':   torch.zeros(x_raw.shape[0]),
+                'prog_mses':   torch.zeros(x_raw.shape[0]),  # zero: x_raw is ground truth
             }]
             metrics = default_collate(metrics)
         else:
@@ -1035,8 +1056,6 @@ class Diffusion_SD(torch.nn.Module):
         Encode integer array k to bits using a prior / coding distribution p.
         We might want to quantize scale for determinism and added stability across multiple machines.
         """
-        # When using a scalar prior it would be better to quantize u as in tfc.UniversalBatchedEntropyModel
-        # assert self.config.model.learned_prior_scale
         em = EntropyModel(p)
         bitstring = em.compress(k)
         return bitstring
@@ -1045,7 +1064,6 @@ class Diffusion_SD(torch.nn.Module):
         """
         Decode integer array from bits using the prior p.
         """
-        # assert self.config.model.learned_prior_scale
         em = EntropyModel(p)
         k = em.decompress(bits)
         return k
@@ -1058,14 +1076,12 @@ class Diffusion_SD(torch.nn.Module):
 
         # accumulate bits
         self.forward(image.to(device), compress_mode='encode', seed=0, timestep_path=timestep_path)
-        print(len(self.compress_bits ))
         return self.compress_bits
 
     @torch.inference_mode()
     def decompress(self, bits, image_shape, recon_method='denoise', timestep_path=None):
         # consume the bits for each step, return the intermediate reconstructions for each step
         self.compress_bits = bits.copy()
-        # consume the bits for each step
         _, metrics = self.forward(torch.zeros(image_shape, device=device), compress_mode='decode',
                                 recon_method=recon_method, seed=0, timestep_path=timestep_path)
         return metrics['prog_x_hats']
@@ -1076,13 +1092,14 @@ class Diffusion_SD(torch.nn.Module):
         z_0_latent: [B, 4, H/8, W/8]
         """
         # Decode latent to pixel space
+        torch.cuda.empty_cache()
+
         with torch.no_grad():
             z_0_pixel = self.vae.decode(z_0_latent / self.vae_scale_factor).sample
 
         gamma_0 = self.gamma(torch.tensor([0], device=device))
 
         z_0_rescaled = z_0_pixel / torch.sqrt(torch.sigmoid(-gamma_0))
-
 
         x_vals = torch.arange(self.config.model.vocab_size, device=z_0_rescaled.device)
 
@@ -1091,15 +1108,16 @@ class Diffusion_SD(torch.nn.Module):
 
         z = z_0_rescaled.unsqueeze(-1)
 
-        logits = -0.5 * torch.exp(-gamma_0) *  (z - x_vals) ** 2
+        logits = -0.5 * torch.exp(-gamma_0) * (z - x_vals) ** 2
 
         logprobs = torch.log_softmax(logits, dim=-1)
 
         if x_raw is None:
             return logprobs
         else:
-            x_one_hot = nn.functional.one_hot(x_raw.long(), num_classes=self.config.model.vocab_size)
-            log_probs = (x_one_hot * logprobs).sum(-1)
+            log_probs = torch.gather(
+                logprobs, dim=-1, index=x_raw.long().unsqueeze(-1)
+            ).squeeze(-1)
             return log_probs
 
     def decode_p_x_z_0(self, z_0_latent, method='argmax'):
@@ -1145,7 +1163,6 @@ class Diffusion_SD(torch.nn.Module):
             gamma = Diffusion_SD.FixedLinearSchedule(gamma_min, gamma_max)
         elif schedule == "learned_linear":
             gamma = Diffusion_SD.LearnedLinearSchedule(gamma_min, gamma_max, config.model.get('fix_gamma_max'))
-        # elif:    # add different noise schedules here
         else:
             raise ValueError('Unknown noise schedule %s' % schedule)
         return gamma
@@ -1176,60 +1193,98 @@ class Diffusion_SD(torch.nn.Module):
             else:
                 return self.b + w * t
 
-    
-
     def save(self):
-        checkpoint = {
-            'step':       self.step,
-            'optimizer':  self.optimizer.state_dict(),
-            'ema':        self.ema.state_dict(),
-            'scale_head': self.score_net.scale_head.state_dict(),
+        # Only the trainable subset of unet needs saving: LoRA adapter matrices
+        # injected into attention layers, plus the widened conv_out (eps/scale
+        # split head). The frozen SD1.5 base weights are reloaded from the
+        # pretrained checkpoint every time, so there's no need to store them.
+        trainable_state = {
+            name: param.detach().cpu()
+            for name, param in self.score_net.unet.named_parameters()
+            if param.requires_grad
         }
-        
+
+        checkpoint = {
+            'step': self.step,
+            'optimizer': self.optimizer.state_dict(),
+            'ema': self.ema.state_dict(),
+            'unet_trainable': trainable_state,  # LoRA weights + conv_out
+        }
+
         os.makedirs(CHECKPOINT_DIR, exist_ok=True)
         path = os.path.join(CHECKPOINT_DIR, f'ckpt_{self.step:07d}.pt')
         torch.save(checkpoint, path)
         print(f'Saved checkpoint → {path}')
 
-
     def load(self, ckpt_path=None):
-        from diffusers import DDPMScheduler, UNet2DConditionModel
-
+        # __init__ on SD15ScoreNet already builds the frozen base UNet,
+        # injects LoRA adapters, and widens conv_out — so the architecture is
+        # always fresh and correct before any weights are loaded into it.
         self.score_net = SD15ScoreNet(self.config)
+
+        # Optimizer/EMA must be rebuilt here, since they need to reference the
+        # *new* parameter tensors just created above — reusing whatever existed
+        # before this call would leave them pointing at stale, discarded params.
+        scale_params = [p for p in self.score_net.unet.parameters() if p.requires_grad]
+        self.optimizer = torch.optim.Adam(
+            scale_params,
+            lr=self.config.optim.lr,
+            weight_decay=self.config.optim.get('weight_decay', 0.0),
+        )
+        self.ema = ExponentialMovingAverage(
+            scale_params,
+            decay=self.config.optim.get('ema_decay', 0.9999),
+        )
 
         if ckpt_path is not None:
             cp = torch.load(ckpt_path, map_location=device, weights_only=False)
-            self.score_net.scale_head.load_state_dict(cp['scale_head'])
+
+            missing, unexpected = self.score_net.unet.load_state_dict(
+                cp['unet_trainable'], strict=False
+            )
+            # `missing` will list every frozen base-weight name — expected, since
+            # those were never in the checkpoint and are already correctly loaded
+            # from from_pretrained. `unexpected` should be empty; if not, the
+            # checkpoint was saved from a differently-shaped model.
+            assert len(unexpected) == 0, f'Unexpected keys in checkpoint: {unexpected}'
+
             if 'optimizer' in cp:
                 self.optimizer.load_state_dict(cp['optimizer'])
             if 'ema' in cp:
                 self.ema.load_state_dict(cp['ema'])
             if 'step' in cp:
                 self.step = cp['step']
-            print(f'Loaded scale_head weights from {ckpt_path}')
+            print(f'Loaded LoRA adapter + conv_out weights from {ckpt_path}')
         else:
-            print('No checkpoint provided — scale_head randomly initialised.')
-
-
+            print('No checkpoint provided — LoRA adapters and conv_out randomly initialised.')
 
     def trainer(self, train_iter, eval_iter=None):
         """
-        Train UQDM for a specified number of steps on a train set.
+        Train UQDM-style SD1.5 model for a specified number of steps on a train set.
         Hyperparameters are set via self.config.training, self.config.eval, and self.config.optim.
-        Only scale_head parameters are trained; the frozen UNet is never touched.
+        Only LoRA adapter weights and the widened conv_out (eps/scale split head)
+        are trained; the frozen SD1.5 base weights are never touched.
         """
-        trainable_params = list(model.score_net.scale_head.parameters())
+        # Pull the trainable set directly off the optimizer's own param groups,
+        # rather than recomputing it separately — guarantees this always matches
+        # whatever __init__/load() actually configured the optimizer with, even
+        # if that set changes later (e.g. two-param-group LR split).
+        trainable_params = [
+            p for group in self.optimizer.param_groups for p in group['params']
+        ]
 
         if self.step >= self.config.training.n_steps:
             print('Skipping training, increase training.n_steps if more steps are desired.')
+        timestep_path = None
 
+        pbar = tqdm(total=self.config.training.n_steps, initial=self.step, desc='Training')
         while self.step < self.config.training.n_steps:
 
             # ── Parameter update ──────────────────────────────────────────────────
             batch = next(train_iter).to(device)
             self.optimizer.zero_grad()
-            model.train()
-            loss, metrics = self(batch)
+            self.score_net.unet.train()  # enables dropout/groupnorm train-mode for LoRA path
+            loss, metrics = self(batch, timestep_path=timestep_path)
             loss.backward()
             if self.config.optim.warmup > 0:
                 for g in self.optimizer.param_groups:
@@ -1241,16 +1296,22 @@ class Diffusion_SD(torch.nn.Module):
                     trainable_params, max_norm=self.config.optim.grad_clip_norm
                 )
             self.optimizer.step()
-            
+
             self.step += 1
             self.ema.update(trainable_params)
-            
+
+            pbar.update(1)
+            pbar.set_postfix(loss=loss.item())
+
             last = self.step == self.config.training.n_steps
+
+            # ── Print loss every 100 steps ──────────────────────────────────────────
+            if self.step % 100 == 0 or last:
+                print(f"[step {self.step}] loss: {loss.item():.6f}")
+
             if self.step % self.config.training.log_metrics_every_steps == 0 or last:
                 self.save()
                 print(metrics)
-            # ── Checkpoint + train metrics ────────────────────────────────────────
-            
 
             # ── Validation metrics ────────────────────────────────────────────────
             if eval_iter is not None and (
@@ -1262,21 +1323,25 @@ class Diffusion_SD(torch.nn.Module):
                     islice(eval_iter, n_batches),
                     total=n_batches or len(eval_iter),
                     desc='Evaluating on test set',
+                    leave=False,
                 ):
                     batch = batch.to(device)
                     with torch.inference_mode():
                         self.ema.store(trainable_params)
                         self.ema.copy_to(trainable_params)
-                        model.eval()
+                        self.score_net.unet.eval()  # disables dropout in resnet blocks for stable eval
                         _, ths_metrics = self(batch)
                         self.ema.restore(trainable_params)
                     res += [ths_metrics]
                 res = default_collate(res)
                 print({k: v.mean().item() for k, v in res.items()})
+        pbar.close()
+
     @staticmethod
     def mse_to_psnr(mse, max_val):
         with np.errstate(divide='ignore'):
             return -10 * (np.log10(mse) - 2 * np.log10(max_val))
+
     @torch.inference_mode()
     def evaluate(self, eval_iter, n_batches=None, seed=None, timestep_path=None):
         """
@@ -1299,12 +1364,12 @@ class Diffusion_SD(torch.nn.Module):
 
             loss, metrics = self(X, recon_method=recon_method, seed=seed, timestep_path=timestep_path)
             print(f"bpd_diff (internal): {metrics['bpd_diff'].item():.4f}")
-            print(f"bpd_latent:      []    {metrics['bpd_latent'].item():.4f}")  
+            print(f"bpd_latent:      []    {metrics['bpd_latent'].item():.4f}")
             print(f"bpd_recon:           {metrics['bpd_recon'].item():.4f}")
             print(f"bpps[-1] before *3:  {np.cumsum(metrics['prog_bpds'].mean(dim=1))[-1]:.4f}")
             print(f"bpps[-1] after *3:   {3*np.cumsum(metrics['prog_bpds'].mean(dim=1))[-1]:.4f}")
 
-            bpds =np.cumsum(metrics['prog_bpds'].mean(dim=1))
+            bpds = np.cumsum(metrics['prog_bpds'].mean(dim=1))
 
             psnrs = self.mse_to_psnr(metrics['prog_mses'].mean(dim=1), max_val=255.)
             ths_res[recon_method] = dict(bpds=bpds, psnrs=psnrs)
@@ -1312,7 +1377,7 @@ class Diffusion_SD(torch.nn.Module):
         res = default_collate(res)
 
         for recon_method in res.keys():
-            bpps = np.round(3* res[recon_method]['bpds'].mean(axis=0).numpy(), 4)
+            bpps = np.round(3 * res[recon_method]['bpds'].mean(axis=0).numpy(), 4)
             psnrs = np.round(res[recon_method]['psnrs'].mean(axis=0).numpy(), 4)
             print('Reconstructions via: %s\nbpps:  %s\npsnrs: %s\n' % (recon_method, bpps, psnrs))
         return bpps, psnrs
@@ -1325,7 +1390,7 @@ class UQDM_SD(Diffusion_SD):
 
     def __init__(self, config):
         """
-        See Diffusion.__init__ for hyperparameters.
+        See Diffusion_SD.__init__ for hyperparameters.
         """
         super().__init__(config)
         self.compress_bits = None
@@ -1349,13 +1414,6 @@ class UQDM_SD(Diffusion_SD):
             # shared U(-0.5, 0.5), seeds have already been set in self.forward
             u = torch.rand(q.mean.shape, device=q.mean.device) - 0.5
 
-            # very slow, ~ 25 symbols/s
-            # cp = tfc.NoisyLogistic(loc=0.0, scale=(p.base_dist.scale / p.delta).cpu().numpy())
-            # em2 = tfc.UniversalBatchedEntropyModel(cp, coding_rank=4, compression=True, num_noise_levels=30)
-            # k = (q.mean - p.mean) / p.delta
-            # bitstring = em2.compress(k.cpu())
-            # k_hat = em2.decompress(bitstring, [])
-
             if compress_mode in ['encode', 'decode']:
                 p_discrete = p.discretize(u)
             if compress_mode == 'decode':
@@ -1376,12 +1434,14 @@ class UQDM_SD(Diffusion_SD):
         rate = torch.sum(rate, dim=[1, 2, 3])
 
         return z_s, rate
-    def _compute_rate_expected(self, q, p, n_samples=5):
+
+    def _compute_rate_expected(self, q, p, n_samples=10):
         rates = torch.stack([
             torch.sum(-p.log_prob(q.sample()), dim=[1, 2, 3])
             for _ in range(n_samples)
         ])
         return rates.mean(0)
+
     @torch.no_grad()
     def compute_cost_matrix_uqdm(self, data_iter, seed=None, timestep_stride=100,
                                 num_images=1, cache_path=None):
@@ -1411,7 +1471,6 @@ class UQDM_SD(Diffusion_SD):
 
         cost_matrix_accum = np.zeros((T, T))
 
-        import time
         start_time = time.time()
 
         for img_idx in range(num_images):
@@ -1441,10 +1500,8 @@ class UQDM_SD(Diffusion_SD):
 
                 z_t = alpha_t * x_latent + sigma_t * base_eps
                 z_cache[ts_val] = z_t.detach()
-                
-
-
                 gamma_t = self.gamma(ts_tensor)
+
                 if self.config.model.get('learned_prior_scale'):
                     eps_hat, pred_scale_factors = self.score_net(z_t, gamma_t)
                     scale_cache[ts_val] = pred_scale_factors.detach()
@@ -1458,20 +1515,6 @@ class UQDM_SD(Diffusion_SD):
 
             # --- Fill cost matrix ---
             cost_matrix_img = np.zeros((T, T))
-            # After cache phase, before inner loop — one-time check
-            ts_t_check, ts_s_check = timesteps[0], timesteps[1]
-            p_loc_ref, p_scale_ref = self.get_s_t_params(z_cache[ts_t_check], ts_t_check, ts_s_check)
-            q_loc_ref, q_scale_ref = self.get_s_t_params(z_cache[ts_t_check], ts_t_check, ts_s_check, x_latent=x_latent)
-
-            p_loc_cm, p_scale_cm, q_loc_cm, q_scale_cm = self._get_params_from_cache(
-                z_cache[ts_t_check], ts_t_check, ts_s_check, x_latent,
-                eps_cache[ts_t_check], scale_cache[ts_t_check]
-            )
-
-            print("p_loc match:", torch.allclose(p_loc_ref, p_loc_cm, atol=1e-5))
-            print("p_scale match:", torch.allclose(p_scale_ref, p_scale_cm, atol=1e-5))
-            print("q_loc match:", torch.allclose(q_loc_ref, q_loc_cm, atol=1e-5))
-            print("q_scale match:", torch.allclose(q_scale_ref, q_scale_cm, atol=1e-5))
             for i, ts_t in enumerate(timesteps):
                 z_t     = z_cache[ts_t]
                 eps_t   = eps_cache[ts_t]
@@ -1489,30 +1532,13 @@ class UQDM_SD(Diffusion_SD):
 
                     rate = self._compute_rate_expected(q, p)
                     cost_matrix_img[i, j] = rate.mean().item() * rescale_pixel_to_bpd * 3
-                    # In cost matrix, for just the first consecutive step i=0, j=1:
-                    if i == 0 and j == 1:
-                        print(f"rate raw (pre-mean): {rate}")          # shape [B]
-                        print(f"rate.mean(): {rate.mean().item()}")
-                        print(f"rescale_pixel_to_bpd: {rescale_pixel_to_bpd}")
-                        print(f"x_raw.shape: {x_raw.shape}")
-                        print(f"rate_bpp this step: {rate.mean().item() * rescale_pixel_to_bpd}")
-                        
-                        # What evaluate() sees for same step — call transmit_q_s_t directly
-                        with torch.inference_mode():
-                            _, rate_ref = self.transmit_q_s_t(x_latent, z_cache[timesteps[0]], 
-                                                            timesteps[0], timesteps[1])
-                        print(f"transmit_q_s_t rate.mean(): {rate_ref.mean().item()}")
-                        print(f"transmit_q_s_t rate_bpp: {rate_ref.mean().item() * rescale_pixel_to_bpd}")
             cost_matrix_accum += cost_matrix_img
-
-            elapsed = time.time() - start_time
-            consecutive_bpp = sum(cost_matrix_img[i, i+1] for i in range(T-1))
 
         # --- Final average ---
         cost_matrix = cost_matrix_accum / num_images
         psnr_per_timestep = psnr_accum / num_images
-        consecutive_bpp = sum(cost_matrix[i, i+1] for i in range(T-1))
         return cost_matrix, timesteps, psnr_per_timestep
+
     def _get_params_from_cache(self, z_t, ts_t, ts_s, x_latent, eps_hat, pred_scale_factors):
         t_tensor   = torch.tensor(ts_t, device=z_t.device)
         s_tensor   = torch.tensor(ts_s, device=z_t.device)
@@ -1524,7 +1550,7 @@ class UQDM_SD(Diffusion_SD):
         sigma_s    = self.sigma(s_tensor)
         expm1_term = (-torch.special.expm1(gamma_s - gamma_t))
 
-        # ── Prior: identical to before ────────────────────────────────────────
+        # ── Prior ──────────────────────────────────────────────────────────────
         p_scale = sigma_s * torch.sqrt(expm1_term)
         if self.config.model.get('base_prior_scale', 'forward_kernel') == 'forward_kernel':
             p_scale = sigma_t * torch.sqrt(expm1_term)
@@ -1535,66 +1561,46 @@ class UQDM_SD(Diffusion_SD):
         # ── Posterior: use TRUE x_latent directly, matching get_s_t_params ───
         q_scale = sigma_s * torch.sqrt(expm1_term)
         q_loc   = alpha_s * ((1 - expm1_term) / alpha_t * z_t + expm1_term * x_latent)
-        #                                                                      ^^^^^^^^^
-        #                                                         NOT recomputed from eps
 
         return p_loc, p_scale, q_loc, q_scale
 
 
-        
-    def _get_posterior_params(self, z_t, t, s, x_latent, eps_t, scale_t):
-        """Extract q(z_s | z_t, x) loc and scale."""
-        alpha_t  = self.alpha(t)
-        alpha_s  = self.alpha(s)
-        sigma_t  = self.sigma(t)
-        sigma_s  = self.sigma(s)
-        alpha_ts = alpha_t / alpha_s
-        sigma2_ts = (sigma_t**2 - alpha_ts**2 * sigma_s**2).clamp(1e-8)
-        sigma2_Q  = (sigma2_ts * sigma_s**2 / sigma_t**2).clamp(1e-8)
-
-        x_hat   = (z_t - sigma_t * eps_t) / alpha_t
-        q_loc   = (alpha_ts * sigma_s**2 / sigma_t**2) * z_t + \
-                (alpha_s  * sigma2_ts  / sigma_t**2) * x_hat
-        q_scale = torch.sqrt(sigma2_Q).expand_as(z_t)
-        return q_loc, q_scale
-    def _get_prior_params(self, z_t, t, s, eps_t, scale_t):
-        """Extract p(z_s | z_t) loc and scale (prior, no x)."""
-        alpha_t  = self.alpha(t)
-        alpha_s  = self.alpha(s)
-        sigma_t  = self.sigma(t)
-        sigma_s  = self.sigma(s)
-        alpha_ts = alpha_t / alpha_s
-        sigma2_ts = (sigma_t**2 - alpha_ts**2 * sigma_s**2).clamp(1e-8)
-
-        # Prior mean: DDIM-style, using eps_t as score estimate
-        p_loc   = (alpha_s / alpha_t) * z_t - \
-                (alpha_s * sigma2_ts / (alpha_t * sigma_t)) * eps_t
-        p_scale = torch.sqrt(sigma2_ts).expand_as(z_t)
-        return p_loc, p_scale
-
 def compute_psnr(pred, target, max_val=None):
-    """Compute PSNR between pred and target tensors."""
+    """
+    Compute PSNR between pred and target tensors/arrays.
+
+    Inputs:
+    -------
+    pred, target - tensors or numpy arrays
+    max_val      - maximum pixel/value range. If None, uses target's max abs value
+                   (useful for latents); pass 255.0 for uint8 images.
+    """
+    if hasattr(pred, 'cpu'):
+        pred = pred.detach().cpu().numpy()
+    if hasattr(target, 'cpu'):
+        target = target.detach().cpu().numpy()
     if max_val is None:
-        max_val = target.abs().max().item()
-    mse = ((pred - target) ** 2).mean().item()
+        max_val = np.abs(target).max()
+
+    mse = np.mean((pred.astype(np.float64) - target.astype(np.float64)) ** 2)
     if mse == 0:
         return float('inf')
-    return 10 * np.log10((max_val ** 2) / mse)
-import time
+    return 20 * np.log10(max_val) - 10 * np.log10(mse)
+
+
 def find_optimal_path_dp(bpp_matrix, timesteps):
     """
     Find optimal transmission path via DP using raw KL-based bpp.
-    
+
     bpp_matrix: [T, T] upper-triangular numpy array of raw KL bpp costs
                 output of compute_cost_matrix()
     timesteps:  list of SD integer timesteps corresponding to matrix indices
-    
+
     Returns:
         optimal_path_indices: list of matrix indices in the optimal path
         timestep_path:        list of SD timesteps in the optimal path
         bpp_breakdown:        dict of cost diagnostics
     """
-    print("Checking KL additivity...")
     T = len(bpp_matrix)
     INF = float('inf')
 
@@ -1644,40 +1650,14 @@ def find_optimal_path_dp(bpp_matrix, timesteps):
     return optimal_path, timestep_path, bpp_breakdown
 
 
-import argparse
-import json
-import os
-from pathlib import Path
-
-import numpy as np
-import torch
-from tqdm import tqdm
-from torchvision.utils import save_image
+# ---------------------------------------------------------------------------
+# FID evaluation (clean-fid based)
+# ---------------------------------------------------------------------------
 
 # pip install clean-fid
 from cleanfid.features import build_feature_extractor
 from cleanfid.fid import frechet_distance
-def compute_psnr(original: np.ndarray, reconstructed: np.ndarray, max_val: float = 255.0) -> float:
-    """
-    Compute Peak Signal-to-Noise Ratio (PSNR) between original and reconstructed images.
-    
-    Args:
-        original: Original image array
-        reconstructed: Reconstructed image array
-        max_val: Maximum pixel value (1.0 for normalized, 255 for uint8)
-    
-    Returns:
-        PSNR value in dB
-    """
-    mse = np.mean((original.astype(np.float64) - reconstructed.astype(np.float64)) ** 2)
-    if mse == 0:
-        return float('inf')
-    return 20 * np.log10(max_val / np.sqrt(mse))
 
-
-# ---------------------------------------------------------------------------
-# Feature extractor (InceptionV3) — shared across all stages
-# ---------------------------------------------------------------------------
 
 def _get_feat_model(device):
     feat_model = build_feature_extractor("clean", device, use_dataparallel=False)
@@ -1732,6 +1712,8 @@ def compute_real_stats(eval_iter_fn, feat_model, device, cache_path: str):
     np.savez(cache_path, mu=mu, sigma=sigma)
     print(f"Saved real stats → {cache_path}")
     return mu, sigma
+
+
 def run_stage(model, eval_iter_fn, feat_model, timestep_path, device):
     from torchmetrics.functional import peak_signal_noise_ratio as psnr
     from torchmetrics.functional import structural_similarity_index_measure as ssim
@@ -1771,7 +1753,7 @@ def run_stage(model, eval_iter_fn, feat_model, timestep_path, device):
             )
 
         img_f = image.float()
-        for step_idx, x_hat in enumerate(reconstructions):  # no slice
+        for step_idx, x_hat in enumerate(reconstructions):
             x_hat_f  = x_hat.float().clamp(0, 255).to(device)
             x_hat_u8 = x_hat_f.byte().cpu()
 
@@ -1886,6 +1868,8 @@ def run_compression_sweep(model, eval_iter_fn, timestep_paths: dict,
             json.dump(results, f, indent=2)
 
     return results
+
+
 def fid_from_stats(mu_real, sigma_real, mu_recon, sigma_recon, n_images) -> float:
     if n_images < 2000:
         print(f"  WARNING: FID computed from only {n_images} images — "
@@ -1895,11 +1879,6 @@ def fid_from_stats(mu_real, sigma_real, mu_recon, sigma_recon, n_images) -> floa
     return float(frechet_distance(mu_real, sigma_real, mu_recon, sigma_recon))
 
 
-
-
-# ---------------------------------------------------------------------------
-# Plotting (unchanged from original)
-# ---------------------------------------------------------------------------
 def plot_fid_vs_rate(fid_results: dict, baselines: dict = None, plot_per_step: bool = True):
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(8, 6))
@@ -1951,7 +1930,7 @@ if __name__ == "__main__":
 
     model = load_checkpoint_SD(config_path=args.config_path, ckpt_path=args.ckpt_path)
     train_iter, eval_iter = load_data_from_folder(args.data, resolution=512)
-    seed=0
+    seed = 0
 
     if args.mode == 'train':
         timesteps = model.sd_scheduler.timesteps.cpu().numpy()
@@ -1976,11 +1955,10 @@ if __name__ == "__main__":
         plt.savefig('noise_schedule.png')
         plt.show()
         model.trainer(train_iter, eval_iter)
- 
-    elif args.mode == 'eval':
 
+    elif args.mode == 'eval':
         os.makedirs(args.save_dir, exist_ok=True)
-        timesteps = None
+        timesteps = [999, 246, 214, 176, 130, 67, 0]
         bpps, psnrs = model.evaluate(eval_iter, n_batches=100, seed=seed, timestep_path=timesteps)
         bpps = np.array(bpps)
         psnrs = np.array(psnrs)
