@@ -349,11 +349,11 @@ def load_data_from_folder(folder_path='data_1/', resolution=512):
     full_dataset = ImageFolderFlat(folder_path)
 
     total_size = len(full_dataset)
-    train_size = int(0.9 * total_size)
+    train_size = 1
     eval_size = total_size - train_size
     train_data, eval_data = random_split(full_dataset, [train_size, eval_size])
 
-    train_iter = DataLoader(train_data, batch_size=32, shuffle=True,
+    train_iter = DataLoader(train_data, batch_size=1, shuffle=True,
                             pin_memory=True, num_workers=0)
     eval_iter = DataLoader(eval_data, batch_size=32, shuffle=False,
                            pin_memory=True, num_workers=0)
@@ -953,95 +953,66 @@ class Diffusion_SD(torch.nn.Module):
             loss_prior = torch.zeros(x_latent.shape[0], device=device)
 
         # ── 2. DIFFUSION LOSS ────────────────────────────────────────────────────
-        if not torch.is_inference_mode_enabled():
-            # Training: single random step, scaled by total_steps (unbiased estimator)
-            rand_idx  = torch.randint(0, total_steps, (1,)).item()
-            ts_t      = sd_timesteps[rand_idx].item()
-            ts_s      = sd_timesteps[rand_idx + 1].item()
-            q_t_dist  = self.q_t(x_latent, t=ts_t)
-            with local_seed(seed, i=rand_idx + 1):
-                z_t   = q_t_dist.sample()
+        z_s       = z_1
+        rate_s    = loss_prior
+        loss_diff = 0.
+        metrics   = []
 
-            p_loc, p_scale = self.get_s_t_params(z_t, ts_t, ts_s,
-                                cache_denoised=(recon_method == 'denoise'))
-            q_loc, q_scale = self.get_s_t_params(z_t, ts_t, ts_s, x_latent=x_latent)
+        for i in range(total_steps):
+            z_t    = z_s
+            rate_t = rate_s
+            ts_t   = sd_timesteps[i].item()
+            ts_s   = sd_timesteps[i + 1].item()
 
-            _, rate_one_step = self.relative_entropy_coding(
-                self.q_s_t(q_loc, q_scale),
-                self.p_s_t(p_loc, p_scale, ts_t, ts_s),
-                compress_mode=compress_mode,
-            )
-            # Scale by total_steps: single-sample unbiased estimator of the full sum
-            loss_diff = rate_one_step * total_steps
+            with local_seed(seed, i=i + 1):
+                z_s, rate_s = self.transmit_q_s_t(
+                    x_latent, z_t, ts_t, ts_s,
+                    compress_mode=compress_mode,
+                    cache_denoised=(recon_method == 'denoise'),
+                    x_raw=x_raw,
+                )
+            loss_diff += rate_s
 
-        else:
-            # Eval: full sequential loop
-            z_s       = z_1
-            loss_diff = 0.
-            metrics   = []
-            prev_rate = loss_prior  # mirrors original: rate_t = rate_s = loss_prior at start
+            if recon_method is not None and not torch.is_inference_mode_enabled() is False:
+                x_hat_t = self.denoise_z_t(z_t, recon_method, times=sd_timesteps[i:])
+                metrics += [{
+                    'prog_bpds':   rate_t.cpu() * rescale_pixel_to_bpd,
+                    'prog_x_hats': x_hat_t.detach().cpu(),
+                    'prog_mses':   torch.mean((x_hat_t - x_raw).float()**2, dim=[1,2,3]).cpu(),
+                }]
 
-            for i in range(total_steps):
-                z_t_loop = z_s
-                ts_t     = sd_timesteps[i].item()
-                ts_s     = sd_timesteps[i + 1].item()
-
-                with local_seed(seed, i=i + 1):
-                    z_s, rate_s = self.transmit_q_s_t(
-                        x_latent, z_t_loop, ts_t, ts_s,
-                        compress_mode=compress_mode,
-                        cache_denoised=(recon_method == 'denoise'),
-                        x_raw=x_raw,
-                    )
-                loss_diff += rate_s
-
-                if recon_method is not None:
-                    x_hat_t = self.denoise_z_t(z_t_loop, recon_method, times=sd_timesteps[i:])
-                    metrics += [{
-                        'prog_bpds':   prev_rate.cpu() * rescale_pixel_to_bpd,  # prev rate
-                        'prog_x_hats': x_hat_t.detach().cpu(),
-                        'prog_mses':   torch.mean((x_hat_t - x_raw).float()**2, dim=[1,2,3]).cpu(),
-                    }]
-
-                prev_rate = rate_s  # update for next iteration
-
-            z_0_latent = z_s
+        z_0_latent = z_s
 
         # ── 3. RECONSTRUCTION LOSS ───────────────────────────────────────────────
-        if not torch.is_inference_mode_enabled():
-            z_0_latent = self.q_t(x_latent, t=sd_timesteps[-1].item()).sample()
-
-        log_probs  = self.log_probs_x_z0(z_0_latent=z_0_latent, x_raw=x_raw)
-        loss_recon = -log_probs.sum(dim=[1, 2, 3])
-        x_raw      = self.transmit_image(z_0_latent, x_raw, compress_mode=compress_mode)
-
-        # ── 4. Aggregate ─────────────────────────────────────────────────────────
-        bpd_latent = loss_prior.mean() * rescale_pixel_to_bpd
-        bpd_diff   = loss_diff.mean()  * rescale_pixel_to_bpd
-        bpd_recon  = loss_recon.mean() * rescale_pixel_to_bpd
-        loss       = bpd_latent + bpd_diff + bpd_recon
-
-        if torch.is_inference_mode_enabled() and recon_method is not None:
+        if recon_method is not None:
             x_hat_final = (self.decode_p_x_z_0(z_0_latent, method='sample')
                         if recon_method == 'ancestral'
                         else self.decode_p_x_z_0(z_0_latent, method='argmax'))
-
-            # Entry 2: final diffusion step rate + reconstruction from z_0
             metrics += [{
                 'prog_bpds':   rate_s.cpu() * rescale_pixel_to_bpd,
                 'prog_x_hats': x_hat_final.detach().cpu(),
                 'prog_mses':   torch.mean((x_hat_final - x_raw).float()**2, dim=[1,2,3]).cpu(),
             }]
 
-            # Entry 3: reconstruction loss + ground truth
+        log_probs  = self.log_probs_x_z0(z_0_latent=z_0_latent, x_raw=x_raw)
+        loss_recon = -log_probs.sum(dim=[1, 2, 3])
+        x_raw      = self.transmit_image(z_0_latent, x_raw, compress_mode=compress_mode)
+
+        if recon_method is not None:
             metrics += [{
-                'prog_bpds':   loss_recon.cpu() * rescale_pixel_to_bpd,  # real entropy cost
+                'prog_bpds':   loss_recon.cpu() * rescale_pixel_to_bpd,
                 'prog_x_hats': x_raw.cpu(),
-                'prog_mses':   torch.zeros(x_raw.shape[0]),  # zero: x_raw is ground truth
+                'prog_mses':   torch.zeros(x_raw.shape[0]),
             }]
             metrics = default_collate(metrics)
         else:
             metrics = {}
+
+        # ── 4. Aggregate ─────────────────────────────────────────────────────────
+        bpd_latent = loss_prior.mean() * rescale_pixel_to_bpd
+        bpd_diff   = loss_diff.mean()  * rescale_pixel_to_bpd
+        bpd_recon  = loss_recon.mean() * rescale_pixel_to_bpd
+        loss       = bpd_latent + bpd_diff + bpd_recon
 
         metrics.update({
             'bpd':        loss,
@@ -1258,7 +1229,7 @@ class Diffusion_SD(torch.nn.Module):
         else:
             print('No checkpoint provided — LoRA adapters and conv_out randomly initialised.')
 
-    def trainer(self, train_iter, eval_iter=None):
+    def trainer(self, train_iter, eval_iter=None, timestep_path=None):
         """
         Train UQDM-style SD1.5 model for a specified number of steps on a train set.
         Hyperparameters are set via self.config.training, self.config.eval, and self.config.optim.
@@ -1275,7 +1246,8 @@ class Diffusion_SD(torch.nn.Module):
 
         if self.step >= self.config.training.n_steps:
             print('Skipping training, increase training.n_steps if more steps are desired.')
-        timestep_path = None
+
+        from tqdm import tqdm
 
         pbar = tqdm(total=self.config.training.n_steps, initial=self.step, desc='Training')
         while self.step < self.config.training.n_steps:
@@ -1312,6 +1284,8 @@ class Diffusion_SD(torch.nn.Module):
             if self.step % self.config.training.log_metrics_every_steps == 0 or last:
                 self.save()
                 print(metrics)
+            # ── Checkpoint + train metrics ────────────────────────────────────────
+
 
             # ── Validation metrics ────────────────────────────────────────────────
             if eval_iter is not None and (
@@ -1933,28 +1907,8 @@ if __name__ == "__main__":
     seed = 0
 
     if args.mode == 'train':
-        timesteps = model.sd_scheduler.timesteps.cpu().numpy()
-        alpha = model.alpha(model.sd_scheduler.timesteps).cpu().numpy()
-        sigma = model.sigma(model.sd_scheduler.timesteps).cpu().numpy()
-
-        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-
-        axes[0].plot(timesteps, alpha)
-        axes[0].set_title('Alpha')
-        axes[0].set_xlabel('Timestep')
-        axes[0].set_ylabel('Alpha')
-        axes[0].grid(True)
-
-        axes[1].plot(timesteps, sigma)
-        axes[1].set_title('Sigma')
-        axes[1].set_xlabel('Timestep')
-        axes[1].set_ylabel('Sigma')
-        axes[1].grid(True)
-
-        plt.tight_layout()
-        plt.savefig('noise_schedule.png')
-        plt.show()
-        model.trainer(train_iter, eval_iter)
+        timesteps =  [999,246,214,176,130,67,1,0]
+        model.trainer(train_iter, eval_iter,timesteps = timesteps)
 
     elif args.mode == 'eval':
         os.makedirs(args.save_dir, exist_ok=True)
