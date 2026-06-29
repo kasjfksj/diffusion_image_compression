@@ -21,7 +21,7 @@ from itertools import islice
 from ml_collections import ConfigDict
 import math
 import time
-
+import lpips   
 from torch.utils.data import Subset, random_split
 from torchvision import transforms
 from PIL import Image
@@ -747,7 +747,7 @@ class Diffusion_SD(torch.nn.Module):
 
         # Optimizer and EMA scoped to trainable LoRA + conv_out params only — frozen UNet is never updated
         scale_params = [p for p in self.score_net.unet.parameters() if p.requires_grad]
-
+        self.lpips_fn = lpips.LPIPS(net='alex').to(device)
         self.optimizer = torch.optim.Adam(
             scale_params,
             lr=self.config.optim.lr,
@@ -799,7 +799,12 @@ class Diffusion_SD(torch.nn.Module):
 
     def relative_entropy_coding(self, q, p, compress_mode=None):
         raise NotImplementedError
-
+    def compute_lpips(self, x_hat, x_raw):
+        """x_hat, x_raw: [B, 3, H, W] in [0, 255]"""
+        x_hat_n = (x_hat.float().to(device) / 127.5) - 1.0  # [0,255] -> [-1,1]
+        x_raw_n = (x_raw.float().to(device) / 127.5) - 1.0
+        with torch.no_grad():
+            return self.lpips_fn(x_hat_n, x_raw_n).squeeze(-1).squeeze(-1).squeeze(-1).cpu()  # [B]
     def get_s_t_params(self, z_t, t, s, x_latent=None, clip_denoised=True, cache_denoised=False, deterministic=False):
         """
         Works in LATENT SPACE.
@@ -979,6 +984,7 @@ class Diffusion_SD(torch.nn.Module):
                     'prog_bpds':   rate_t.cpu() * rescale_pixel_to_bpd,
                     'prog_x_hats': x_hat_t.detach().cpu(),
                     'prog_mses':   torch.mean((x_hat_t - x_raw).float()**2, dim=[1,2,3]).cpu(),
+                    'prog_lpips': self.compute_lpips(x_hat_t, x_raw),
                 }]
 
         z_0_latent = z_s
@@ -992,6 +998,7 @@ class Diffusion_SD(torch.nn.Module):
                 'prog_bpds':   rate_s.cpu() * rescale_pixel_to_bpd,
                 'prog_x_hats': x_hat_final.detach().cpu(),
                 'prog_mses':   torch.mean((x_hat_final - x_raw).float()**2, dim=[1,2,3]).cpu(),
+                'prog_lpips': self.compute_lpips(x_hat_final, x_raw),
             }]
 
         log_probs  = self.log_probs_x_z0(z_0_latent=z_0_latent, x_raw=x_raw)
@@ -1003,6 +1010,7 @@ class Diffusion_SD(torch.nn.Module):
                 'prog_bpds':   loss_recon.cpu() * rescale_pixel_to_bpd,
                 'prog_x_hats': x_raw.cpu(),
                 'prog_mses':   torch.zeros(x_raw.shape[0]),
+                'prog_lpips':  torch.zeros(x_raw.shape[0]),
             }]
             metrics = default_collate(metrics)
         else:
@@ -1346,15 +1354,17 @@ class Diffusion_SD(torch.nn.Module):
             bpds = np.cumsum(metrics['prog_bpds'].mean(dim=1))
 
             psnrs = self.mse_to_psnr(metrics['prog_mses'].mean(dim=1), max_val=255.)
-            ths_res[recon_method] = dict(bpds=bpds, psnrs=psnrs)
+            lpips_ = metrics['prog_lpips'].mean(dim=1).numpy()
+            ths_res[recon_method] = dict(bpds=bpds, psnrs=psnrs, lpips=lpips_)
             res += [ths_res]
         res = default_collate(res)
 
         for recon_method in res.keys():
             bpps = np.round(3 * res[recon_method]['bpds'].mean(axis=0).numpy(), 4)
             psnrs = np.round(res[recon_method]['psnrs'].mean(axis=0).numpy(), 4)
-            print('Reconstructions via: %s\nbpps:  %s\npsnrs: %s\n' % (recon_method, bpps, psnrs))
-        return bpps, psnrs
+            lpips_ = np.round(    res[recon_method]['lpips'].mean(axis=0).numpy(),  4)
+            print('Reconstructions via: %s\nbpps:  %s\npsnrs: %s\nlpips: %s\n' % (recon_method, bpps, psnrs, lpips_))
+        return bpps, psnrs, lpips_
 
 
 class UQDM_SD(Diffusion_SD):
@@ -1913,19 +1923,29 @@ if __name__ == "__main__":
     elif args.mode == 'eval':
         os.makedirs(args.save_dir, exist_ok=True)
         timesteps = [999, 246, 214, 176, 130, 67, 0]
-        bpps, psnrs = model.evaluate(eval_iter, n_batches=100, seed=seed, timestep_path=timesteps)
+        bpps, psnrs, lpips_ = model.evaluate(eval_iter, n_batches=100, seed=seed, timestep_path=timesteps)
         bpps = np.array(bpps)
         psnrs = np.array(psnrs)
-
+        lpips_ = np.array(lpips_)
         # Save to txt
-        np.savetxt('uqdm.txt', np.column_stack([bpps, psnrs]), header='bpp psnr', fmt='%.6f')
+        np.savetxt('uqdm.txt', np.column_stack([bpps, psnrs, lpips_]), header='bpp psnr lpips', fmt='%.6f')
 
-        # Save plot as png
-        plt.figure()
-        plt.plot(bpps, psnrs, 'o-')
-        plt.xlabel('BPP')
-        plt.ylabel('PSNR (dB)')
-        plt.title('Rate-Distortion Curve')
-        plt.grid(True)
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        
+        # Subplot 1: PSNR vs BPP
+        ax1.plot(bpps, psnrs, linestyle='-', linewidth=1.5)  # Clean line without markers
+        ax1.set_xlabel('BPP')
+        ax1.set_ylabel('PSNR (dB)')
+        ax1.set_title('Rate-Distortion (PSNR vs BPP)')
+        ax1.grid(True)
+        
+        # Subplot 2: LPIPS vs BPP
+        ax2.plot(bpps, lpips_, linestyle='-', linewidth=1.5)  # Clean line without markers
+        ax2.set_xlabel('BPP')
+        ax2.set_ylabel('LPIPS')
+        ax2.set_title('Rate-Distortion (LPIPS vs BPP)')
+        ax2.grid(True)
+        
+        plt.tight_layout()
         plt.savefig('uqdm.png', dpi=150, bbox_inches='tight')
         plt.close()
