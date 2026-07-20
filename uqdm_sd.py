@@ -25,7 +25,12 @@ import lpips
 from torch.utils.data import Subset, random_split
 from torchvision import transforms
 from PIL import Image
-
+from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.image.inception import InceptionScore
+from torch.nn.functional import adaptive_avg_pool2d
+import torchvision.transforms.functional as TF
+from cleanfid.features import build_feature_extractor
+from cleanfid.fid import frechet_distance
 device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
 
 DATASET_PATH = {
@@ -38,6 +43,119 @@ def softplus_inverse(x):
     import math
     import numpy as np
     return math.log(np.expm1(x))
+class InceptionFeatureExtractor(torch.nn.Module):
+    def __init__(self, device="cuda"):
+        super().__init__()
+        self.fid_metric = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
+        self.device = device
+
+    @torch.no_grad()
+    def extract(self, images: torch.Tensor) -> torch.Tensor:
+        """
+        images: [B, 3, H, W] float in [0, 255]
+        returns: [B, 2048] inception features
+        """
+        images = images.clamp(0, 255).to(torch.uint8).to(self.device)  # uint8 as torchmetrics expects
+        self.fid_metric.inception.eval()
+        feats = self.fid_metric.inception(images)
+        return feats.cpu()
+def save_features(
+    features: torch.Tensor,
+    save_dir: str,
+    split: str,           # e.g. 'real' or 'fake'
+    timestep: int,        # e.g. ts_s value
+    shard_id: int = 0,    # increment per batch to avoid overwriting
+):
+    """
+    Save a [B, 2048] feature tensor to:
+    {save_dir}/t{timestep:04d}/{split}_shard{shard_id:05d}.pt
+    """
+    folder = os.path.join(save_dir, f"t{timestep:04d}")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"{split}_shard{shard_id:05d}.pt")
+    torch.save(features, path)
+    return path
+
+
+def list_timesteps(save_dir: str) -> list[int]:
+    """Return all timesteps that have saved features under save_dir."""
+    dirs = [d for d in os.listdir(save_dir) if d.startswith("t") and os.path.isdir(os.path.join(save_dir, d))]
+    return sorted(int(d[1:]) for d in dirs)
+def compute_fid_from_features(
+    real_feats: torch.Tensor,   # [N, 2048]
+    fake_feats: torch.Tensor,   # [M, 2048]
+) -> float:
+    """
+    Compute FID directly from pre-extracted feature tensors,
+    bypassing any image re-processing.
+    """
+    def _stats(f):
+        mu  = f.mean(dim=0).numpy()          # [2048]
+        sig = np.cov(f.numpy(), rowvar=False) # [2048, 2048]
+        return mu, sig
+
+    mu_r, sig_r = _stats(real_feats.float())
+    mu_f, sig_f = _stats(fake_feats.float())
+
+    diff = mu_r - mu_f
+    # Symmetric matrix square root via eigen-decomposition (more stable than scipy sqrtm)
+    vals_r, vecs_r = np.linalg.eigh(sig_r)
+    vals_f, vecs_f = np.linalg.eigh(sig_f)
+    sqrt_r = vecs_r @ np.diag(np.sqrt(np.maximum(vals_r, 0))) @ vecs_r.T
+    covmean = sqrt_r @ sig_f @ sqrt_r
+    vals_c, vecs_c = np.linalg.eigh(covmean)
+    sqrt_cov = vecs_c @ np.diag(np.sqrt(np.maximum(vals_c, 0))) @ vecs_c.T
+
+    fid = float(diff @ diff + np.trace(sig_r + sig_f - 2 * sqrt_cov))
+    return fid
+
+
+def compute_fid_all_timesteps(
+    save_dir: str,
+    min_samples: int = 2048,
+    device: str = "cuda",
+) -> dict[int, float]:
+    """
+    Load stored features for every timestep under save_dir and compute FID.
+    Returns {timestep -> fid_score}.
+    """
+    results = {}
+    for ts in list_timesteps(save_dir):
+        try:
+            real_feats = load_features(save_dir, split="real", timestep=ts)
+            fake_feats = load_features(save_dir, split="fake", timestep=ts)
+        except FileNotFoundError as e:
+            print(f"[FID] Skipping t={ts}: {e}")
+            continue
+
+        n_real, n_fake = real_feats.shape[0], fake_feats.shape[0]
+        if min(n_real, n_fake) < min_samples:
+            print(f"[FID] Skipping t={ts}: only {n_real} real / {n_fake} fake samples")
+            continue
+
+        fid = compute_fid_from_features(real_feats, fake_feats)
+        results[ts] = fid
+        print(f"[FID] t={ts:4d} | real={n_real} fake={n_fake} | FID={fid:.3f}")
+
+    return results
+def load_features(
+    save_dir: str,
+    split: str,
+    timestep: int,
+) -> torch.Tensor:
+    """
+    Load and concatenate all shards for a given timestep and split.
+    Returns [N, 2048].
+    """
+    folder = os.path.join(save_dir, f"t{timestep:04d}")
+    shards = sorted(
+        f for f in os.listdir(folder)
+        if f.startswith(split) and f.endswith(".pt")
+    )
+    if not shards:
+        raise FileNotFoundError(f"No shards found for split='{split}' at {folder}")
+    return torch.cat([torch.load(os.path.join(folder, s)) for s in shards], dim=0)
+
 
 
 class SD15ScoreNet(torch.nn.Module):
@@ -757,6 +875,8 @@ class Diffusion_SD(torch.nn.Module):
             scale_params,
             decay=self.config.optim.get('ema_decay', 0.9999),
         )
+        self.feat_extractor = InceptionFeatureExtractor(device="cuda")
+        self._fid_shard_counters = {}
 
     def gamma(self, t):
         """Log-SNR at integer SD timestep t in [0, 999]."""
@@ -805,6 +925,22 @@ class Diffusion_SD(torch.nn.Module):
         x_raw_n = (x_raw.float().to(device) / 127.5) - 1.0
         with torch.no_grad():
             return self.lpips_fn(x_hat_n, x_raw_n).squeeze(-1).squeeze(-1).squeeze(-1).cpu()  # [B]
+    def extract_and_save_features(
+        self,
+        x_hat: torch.Tensor,   # [B, 3, H, W] in [0, 255]
+        x_raw: torch.Tensor,   # [B, 3, H, W] in [0, 255]
+        timestep: int,
+        save_dir: str,
+    ):
+        """Drop-in call inside the forward() diffusion loop."""
+        for split, imgs in [("real", x_raw), ("fake", x_hat)]:
+            key = (split, timestep)
+            shard_id = self._fid_shard_counters.get(key, 0)
+
+            feats = self.feat_extractor.extract(imgs)  # [B, 2048]
+            save_features(feats, save_dir, split=split, timestep=timestep, shard_id=shard_id)
+
+            self._fid_shard_counters[key] = shard_id + 1
     def get_s_t_params(self, z_t, t, s, x_latent=None, clip_denoised=True, cache_denoised=False, deterministic=False):
         """
         Works in LATENT SPACE.
@@ -1639,8 +1775,7 @@ def find_optimal_path_dp(bpp_matrix, timesteps):
 # ---------------------------------------------------------------------------
 
 # pip install clean-fid
-from cleanfid.features import build_feature_extractor
-from cleanfid.fid import frechet_distance
+
 
 
 def _get_feat_model(device):
@@ -1891,7 +2026,24 @@ def plot_fid_vs_rate(fid_results: dict, baselines: dict = None, plot_per_step: b
     plt.tight_layout()
     plt.savefig("fid_vs_rate.png", dpi=150)
     plt.show()
-
+def resize_and_crop(image, size=512):
+    """
+    Resize shortest edge to size, then center crop to size x size.
+    image: [B, C, H, W] in [0, 255] uint8
+    """
+    B = image.shape[0]
+    result = []
+    for b in range(B):
+        img = image[b]  # [C, H, W]
+        # Resize shortest edge to 512
+        h, w = img.shape[-2], img.shape[-1]
+        scale = size / min(h, w)
+        new_h, new_w = int(h * scale), int(w * scale)
+        img = TF.resize(img, [new_h, new_w], antialias=True)
+        # Center crop to 512x512
+        img = TF.center_crop(img, [size, size])
+        result.append(img)
+    return torch.stack(result) 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -1904,7 +2056,13 @@ if __name__ == "__main__":
     parser.add_argument("--recon_method",
                         choices=["ancestral", "flow_based", "denoise"],
                         default="ancestral")
-    parser.add_argument("--data", default="data_1/")
+    parser.add_argument("--data", default="kodak/")
+    parser.add_argument("--fid_data", default=None,
+                    help="Path to separate dataset for FID (e.g. COCO val). "
+                         "If None, FID is skipped.")
+    parser.add_argument("--fid_save_dir", default="fid_features")
+    parser.add_argument("--fid_num_images", type=int, default=5000)
+    args = parser.parse_args()
     args = parser.parse_args()
 
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
@@ -1922,30 +2080,113 @@ if __name__ == "__main__":
 
     elif args.mode == 'eval':
         os.makedirs(args.save_dir, exist_ok=True)
-        timesteps = [999, 246, 214, 176, 130, 67, 0]
-        bpps, psnrs, lpips_ = model.evaluate(eval_iter, n_batches=100, seed=seed, timestep_path=timesteps)
-        bpps = np.array(bpps)
-        psnrs = np.array(psnrs)
-        lpips_ = np.array(lpips_)
-        # Save to txt
-        np.savetxt('uqdm.txt', np.column_stack([bpps, psnrs, lpips_]), header='bpp psnr lpips', fmt='%.6f')
 
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-        
-        # Subplot 1: PSNR vs BPP
-        ax1.plot(bpps, psnrs, linestyle='-', linewidth=1.5)  # Clean line without markers
-        ax1.set_xlabel('BPP')
-        ax1.set_ylabel('PSNR (dB)')
-        ax1.set_title('Rate-Distortion (PSNR vs BPP)')
-        ax1.grid(True)
-        
-        # Subplot 2: LPIPS vs BPP
-        ax2.plot(bpps, lpips_, linestyle='-', linewidth=1.5)  # Clean line without markers
-        ax2.set_xlabel('BPP')
-        ax2.set_ylabel('LPIPS')
-        ax2.set_title('Rate-Distortion (LPIPS vs BPP)')
-        ax2.grid(True)
-        
-        plt.tight_layout()
-        plt.savefig('uqdm.png', dpi=150, bbox_inches='tight')
-        plt.close()
+        timesteps = [999, 312, 110, 0]
+
+        # ── 1. RD metrics loop (Kodak / small set) ────────────────────────────────
+        all_bpps, all_psnrs, all_lpips = [], [], []
+        all_compress_times, all_decompress_times = [], []
+        num_images_to_plot = 24
+
+        for i, image in enumerate(train_iter):
+            compressed, compress_time = model.compress(image, timestep_path=timesteps)
+            bits = [len(b) * 8 for b in compressed]
+            reconstructions, decompress_time = model.decompress(
+                compressed, image.shape, recon_method='flow_based', timestep_path=timesteps
+            )
+            assert (reconstructions[-1] == image).all()
+            reconstructions = reconstructions[1:]
+
+            psnrs = [compute_psnr(image, recon) for recon in reconstructions]
+            lpips_scores = [
+                model.compute_lpips(recon, image).item() for recon in reconstructions
+            ]
+            bpps = [len(b) * 8 / (image.shape[-1] * image.shape[-2]) for b in compressed]
+
+            all_bpps.append(bpps)
+            all_psnrs.append(psnrs)
+            all_lpips.append(lpips_scores)
+            all_compress_times.append(compress_time)
+            all_decompress_times.append(decompress_time)
+
+            print(f'Image {i}: bpps={np.round(bpps, 4)}, PSNR={np.round(psnrs, 4)}, '
+                f'LPIPS={np.round(lpips_scores, 4)}')
+
+            if i + 1 >= num_images_to_plot:
+                break
+
+        all_bpps  = np.stack(all_bpps)
+        all_psnrs = np.stack(all_psnrs)
+        all_lpips = np.stack(all_lpips)
+        mean_bpps  = np.mean(all_bpps,  axis=0)
+        mean_psnrs = np.mean(all_psnrs, axis=0)
+        mean_lpips = np.mean(all_lpips, axis=0)
+
+        print("Mean BPP per step:",   np.round(mean_bpps,  4))
+        print("Mean PSNR per step:",  np.round(mean_psnrs, 4))
+        print("Mean LPIPS per step:", np.round(mean_lpips, 4))
+
+        np.savetxt(os.path.join(args.save_dir, 'mean_bpps.txt'),  mean_bpps,  fmt='%.6f', header='bpp')
+        np.savetxt(os.path.join(args.save_dir, 'mean_psnrs.txt'), mean_psnrs, fmt='%.6f', header='psnr')
+        np.savetxt(os.path.join(args.save_dir, 'mean_lpips.txt'), mean_lpips, fmt='%.6f', header='lpips')
+
+        if args.fid_data is not None:
+            print(f"\n{'='*60}")
+            print(f"FID extraction on: {args.fid_data}  ({args.fid_num_images} images)")
+            print(f"Saving features to: {args.fid_save_dir}")
+            print(f"{'='*60}\n")
+
+            os.makedirs(args.fid_save_dir, exist_ok=True)
+            _, fid_iter = load_data_from_folder(args.fid_data, resolution=512)
+            model._fid_shard_counters = {}
+
+            for i, image in enumerate(fid_iter):
+                if i >= args.fid_num_images:
+                    break
+                image = resize_and_crop(image, size=512)
+                compressed, _ = model.compress(image, timestep_path=timesteps)
+                reconstructions, _ = model.decompress(
+                    compressed, image.shape,
+                    recon_method='flow_based',
+                    timestep_path=timesteps,
+                )
+                reconstructions = reconstructions[1:]
+
+                for recon, ts in zip(reconstructions, timesteps[1:]):
+                    model.extract_and_save_features(
+                        x_hat=recon,
+                        x_raw=image,
+                        timestep=ts,
+                        save_dir=args.fid_save_dir,
+                    )
+
+                if i % 50 == 0:
+                    print(f"[FID] {i+1}/{args.fid_num_images} images processed...")
+
+            # ── 3. Compute + report FID aligned with RD metrics ───────────────────
+            fid_scores = compute_fid_all_timesteps(args.fid_save_dir, min_samples=100)
+
+            print(f"\n{'='*60}")
+            print(f"{'Timestep':>10} | {'BPP':>8} | {'PSNR':>8} | {'LPIPS':>8} | {'FID':>8}")
+            print(f"{'-'*10}-+-{'-'*8}-+-{'-'*8}-+-{'-'*8}-+-{'-'*8}")
+            for step_idx, ts in enumerate(timesteps[1:]):
+                print(
+                    f"{ts:>10} | {mean_bpps[step_idx]:>8.4f} | "
+                    f"{mean_psnrs[step_idx]:>8.4f} | "
+                    f"{mean_lpips[step_idx]:>8.4f} | "
+                    f"{fid_scores.get(ts, float('nan')):>8.3f}"
+                )
+            print(f"{'='*60}\n")
+
+            np.savetxt(
+                os.path.join(args.save_dir, 'fid_results.txt'),
+                np.column_stack([
+                    timesteps[1:],
+                    mean_bpps,
+                    mean_psnrs,
+                    mean_lpips,
+                    [fid_scores.get(ts, float('nan')) for ts in timesteps[1:]],
+                ]),
+                header='timestep bpp psnr lpips fid', fmt='%.6f'
+            )
+            print(f"[FID] Saved to {os.path.join(args.save_dir, 'fid_results.txt')}")
