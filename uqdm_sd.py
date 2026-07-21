@@ -159,73 +159,52 @@ def load_features(
 
 
 class SD15ScoreNet(torch.nn.Module):
-    """
-    SD1.5 UNet + LoRA, with variance prediction implemented VDM-Net style:
-    the shared trunk's own conv_out is widened to emit eps + scale jointly,
-    rather than using a separate side-head.
-    """
-
-    @staticmethod
-    def softplus_inverse(x):
-        import math
-        import numpy as np
-        return math.log(np.expm1(x))
-
-    def softplus_init1(self, x):
-        return torch.nn.functional.softplus(x + self.SOFTPLUS_INV1)
-
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.mcfg = config.model
-        self.SOFTPLUS_INV1 = self.softplus_inverse(1.0)
+        self.SOFTPLUS_INV1 = softplus_inverse(1.0)
 
         self.unet = UNet2DConditionModel.from_pretrained(
             "runwayml/stable-diffusion-v1-5",
             subfolder="unet"
         ).cuda()
         self.sd_scheduler = DDPMScheduler.from_pretrained(
-            "stable-diffusion-v1-5/stable-diffusion-v1-5",
+            "runwayml/stable-diffusion-v1-5",
             subfolder="scheduler"
         )
 
-        # --- Freeze the base UNet, then inject LoRA into the trunk's attention ---
-        self.unet.requires_grad_(False)
+        # Scale head takes the penultimate UNet latent (320 channels from conv_in path)
+        # SD1.5 UNet final conv_out goes from 320 -> 4, so we hook before it
+        penultimate_channels = self.unet.conv_out.in_channels  # typically 320
+        self.scale_head = nn.Sequential(
+            nn.Conv2d(penultimate_channels, 128, kernel_size=1),  # index 0 — was 128, not 64
+            nn.SiLU(),                                             # index 1
+            nn.Conv2d(128, 64, kernel_size=1),                    # index 2 — was 128→64, not 64→4
+            nn.SiLU(),                                             # index 3
+            nn.Conv2d(64, 4, kernel_size=1),                      # index 4 — the "unexpected" layer
+        ).cuda()
+        for p in self.unet.parameters():
+            p.requires_grad_(False)
+        # # Zero-init the last layer for stable training start
+        nn.init.kaiming_normal_(self.scale_head[0].weight, mode='fan_out', nonlinearity='relu')
+        nn.init.zeros_(self.scale_head[0].bias)
+        nn.init.xavier_normal_(self.scale_head[-1].weight, gain=0.01)  # small but non-zero
+        nn.init.zeros_(self.scale_head[-1].bias)
+        self.unet.enable_gradient_checkpointing()
+        self._penultimate_latent = None
+        self._register_penultimate_hook()
 
-        lora_rank = getattr(self.mcfg, "lora_rank", 16)
-        lora_alpha = getattr(self.mcfg, "lora_alpha", 16)
-        lora_config = LoraConfig(
-            r=lora_rank,
-            lora_alpha=lora_alpha,
-            init_lora_weights="gaussian",
-            target_modules=["to_k", "to_q", "to_v", "to_out.0"],
-        )
-        self.unet.add_adapter(lora_config)
+    def _register_penultimate_hook(self):
+        """Hook the layer immediately before conv_out to capture its output."""
+        def hook_fn(module, input, output):
+            # input[0] is the tensor fed into conv_out — the penultimate latent
+            self._penultimate_latent = input[0]
 
-        # --- Widen conv_out to emit eps (4ch) + scale logits (4ch), VDM-style ---
-        self.n_channels = self.unet.conv_out.out_channels  # 4
-        in_ch = self.unet.conv_out.in_channels             # 320
-        old_conv_out = self.unet.conv_out
+        self.unet.conv_out.register_forward_hook(hook_fn)
 
-        new_conv_out = nn.Conv2d(
-            in_ch, self.n_channels * 2, kernel_size=3, padding=1,
-            dtype=old_conv_out.weight.dtype, device=old_conv_out.weight.device,
-        )
-        with torch.no_grad():
-            # First half: copy pretrained eps-prediction weights verbatim.
-            new_conv_out.weight[: self.n_channels].copy_(old_conv_out.weight)
-            new_conv_out.bias[: self.n_channels].copy_(old_conv_out.bias)
-            # Second half: zero-init, so scale logits start at 0 ->
-            # softplus_init1(0) == 1, matching VDM_Net's zero_init behaviour.
-            nn.init.zeros_(new_conv_out.weight[self.n_channels:])
-            nn.init.zeros_(new_conv_out.bias[self.n_channels:])
-
-        self.unet.conv_out = new_conv_out
-        # This is a fresh layer with no pretrained prior worth preserving via
-        # LoRA's low-rank constraint — train it directly, full-rank.
-        self.unet.conv_out.requires_grad_(True)
-
-        self.unet.train()
+    def softplus_init1(self, x):
+        return torch.nn.functional.softplus(x + self.SOFTPLUS_INV1)
 
     def forward(self, z, g_t):
         g_t = g_t.expand(z.shape[0])
@@ -234,33 +213,19 @@ class SD15ScoreNet(torch.nn.Module):
         alphas_cumprod = self.sd_scheduler.alphas_cumprod.to(z.device)
         diffs = (alphas_cumprod.unsqueeze(0) - alpha2_target.unsqueeze(1)).abs()
         timesteps = diffs.argmin(dim=1).long()
-
         null_cond = torch.zeros(z.shape[0], 77, 768, device=z.device, dtype=z.dtype)
 
-        # No no_grad — LoRA params and the new conv_out need a live graph.
-        h = self.unet(z, timesteps, encoder_hidden_states=null_cond).sample  # (B, 8, H, W)
+        # UNet forward — no grad for the UNet weights, but hook captures the
+        # penultimate latent so scale_head can still receive gradients through it
+        eps_hat = self.unet(z, timesteps, encoder_hidden_states=null_cond).sample
 
-        eps_hat, scale_logits = torch.split(h, self.n_channels, dim=1)
-        pred_scale_factors = self.softplus_init1(scale_logits)
+        # _penultimate_latent was captured inside the no_grad block, so we must
+        # re-enable grad for the scale_head branch
+        penultimate = self._penultimate_latent
 
-        # SD1.5's native parameterization already predicts epsilon directly
-        # (unlike VDM_Net's residual "+z"), so no extra add is needed here.
+        pred_scale_factors = self.softplus_init1(self.scale_head(penultimate))
+
         return eps_hat, pred_scale_factors
-
-    def trainable_parameters(self):
-        return [p for p in self.unet.parameters() if p.requires_grad]
-
-    def save_adapter(self, path):
-        # Saves LoRA weights. The widened conv_out isn't a LoRA layer, so
-        # save it separately if you want to reload it later.
-        self.unet.save_lora_adapter(path)
-        torch.save(self.unet.conv_out.state_dict(), f"{path}/conv_out.pt")
-
-    def load_adapter(self, path):
-        self.unet.load_lora_adapter(path)
-        self.unet.conv_out.load_state_dict(torch.load(f"{path}/conv_out.pt"))
-
-
 class ExponentialMovingAverage:
     """
     Maintains (exponential) moving average of a set of parameters.
