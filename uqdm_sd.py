@@ -829,7 +829,7 @@ class Diffusion_SD(torch.nn.Module):
         self.score_net = SD15ScoreNet(self.config)
 
         # Optimizer and EMA scoped to trainable LoRA + conv_out params only — frozen UNet is never updated
-        scale_params = [p for p in self.score_net.unet.parameters() if p.requires_grad]
+        scale_params = [p for p in self.score_net.parameters() if p.requires_grad]
         self.lpips_fn = lpips.LPIPS(net='alex').to(device)
         self.optimizer = torch.optim.Adam(
             scale_params,
@@ -1305,7 +1305,7 @@ class Diffusion_SD(torch.nn.Module):
         # Optimizer/EMA must be rebuilt here, since they need to reference the
         # *new* parameter tensors just created above — reusing whatever existed
         # before this call would leave them pointing at stale, discarded params.
-        scale_params = [p for p in self.score_net.unet.parameters() if p.requires_grad]
+        scale_params = [p for p in self.score_net.parameters() if p.requires_grad]
         self.optimizer = torch.optim.Adam(
             scale_params,
             lr=self.config.optim.lr,
