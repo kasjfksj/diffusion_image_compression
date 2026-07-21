@@ -37,7 +37,11 @@ DATASET_PATH = {
     'ImageNet64': 'data/imagenet64/',
 }
 
-
+DDIM_SCHEDULE = [981, 961, 941, 921, 901, 881, 861, 841, 821, 801, 781, 761,
+                 741, 721, 701, 681, 661, 641, 621, 601, 581, 561, 541, 521,
+                 501, 481, 461, 441, 421, 401, 381, 361, 341, 321, 301, 281,
+                 261, 241, 221, 201, 181, 161, 141, 121, 101,  81,  61,  41,
+                  21,  10,   5,   0]
 def softplus_inverse(x):
     """Helper which computes the inverse of `tf.nn.softplus`."""
     import math
@@ -714,6 +718,7 @@ class EntropyModel:
         self.prior_shape = self.prior.probs.shape[:-1]
         self.precision = range_coder_precision
 
+        # Build quantization tables
         # Build quantization tables — stay on CPU throughout
         total = 2 ** self.precision
         probs = self.prior.probs.reshape(-1, self.prior.probs.shape[-1]).cpu().float()
@@ -728,11 +733,10 @@ class EntropyModel:
                 break
             penalty = probs[mask] * (torch.log2(1 + 1 / (quantized_pdf[mask] - 1)))
             idx = penalty.nan_to_num(torch.inf).argmin(dim=-1)
-            quantized_pdf[mask] -= torch.zeros_like(quantized_pdf[mask]).scatter_(
-                1, idx.unsqueeze(1), 1
-            )
-
+            excess = sums[mask] - total
+            quantized_pdf[mask, idx] -= excess.clamp(max=quantized_pdf[mask, idx] - 1)  # keep min 1
         # Normalize: increase underflowing rows
+
         while True:
             sums = quantized_pdf.sum(dim=-1)
             mask = sums < total
@@ -740,9 +744,8 @@ class EntropyModel:
                 break
             penalty = probs[mask] * (torch.log2(1 + 1 / quantized_pdf[mask]))
             idx = penalty.argmax(dim=-1)
-            quantized_pdf[mask] += torch.zeros_like(quantized_pdf[mask]).scatter_(
-                1, idx.unsqueeze(1), 1
-            )
+            deficit = total - sums[mask]
+            quantized_pdf[mask, idx] += deficit
 
         quantized_cdf = torch.cumsum(quantized_pdf, dim=-1)
 
@@ -760,11 +763,13 @@ class EntropyModel:
         """
         Compresses a floating-point tensor to a bit string with the discretized prior.
         """
+
         x = (x - self.offsets).to(torch.int32).reshape(-1).cpu()
         codec = gen_ops.create_range_encoder([], self.quantized_cdf.cpu())
         codec = gen_ops.entropy_encode_index(codec, self.indexes.cpu(), x)
         bits = gen_ops.entropy_encode_finalize(codec).numpy()
 
+        
         return bits
 
     def decompress(self, bits):
@@ -775,6 +780,7 @@ class EntropyModel:
         bits = tf.convert_to_tensor(bits, dtype=tf.string)
         codec = gen_ops.create_range_decoder(bits, self.quantized_cdf.cpu())
         codec, x = gen_ops.entropy_decode_index(codec, self.indexes.cpu(), self.indexes.shape, tf.int32)
+        # sanity = gen_ops.entropy_decode_finalize(codec)
         x = torch.from_numpy(x.numpy()).reshape(self.prior_shape).to(device).to(torch.float32) + self.offsets
         return x
 
@@ -850,24 +856,33 @@ class Diffusion_SD(torch.nn.Module):
         return torch.log((1.0 - alpha_bar) / alpha_bar)
 
     def sigma2(self, t):
-        return (1.0 - self.alphas_cumprod[t])
+        return torch.sigmoid(self.gamma(t))
 
     def sigma(self, t):
         return torch.sqrt(self.sigma2(t))
 
     def alpha(self, t):
-        return torch.sqrt(self.alphas_cumprod[t])
-
+        return torch.sqrt(torch.sigmoid(-self.gamma(t)))
+    def compute_lpips(self, x_hat, x_raw):
+        """x_hat, x_raw: [B, 3, H, W] in [0, 255]"""
+        x_hat_n = (x_hat.float().to(device) / 127.5) - 1.0  # [0,255] -> [-1,1]
+        x_raw_n = (x_raw.float().to(device) / 127.5) - 1.0
+        with torch.no_grad():
+            return self.lpips_fn(x_hat_n, x_raw_n).squeeze(-1).squeeze(-1).squeeze(-1).cpu()  # [B]
+    
     def q_t(self, x_latent, t=1):
         # q(z_t | x_latent) = N(alpha_t * x_latent, sigma^2_t)
-        # x_latent is in latent space [B, 4, H/8, W/8]
+        # Now x_latent is in latent space [B, 4, H/8, W/8]
         return Normal(loc=self.alpha(t) * x_latent, scale=self.sigma(t))
 
     def p_1(self):
         # p(z_1) = N(0, 1) - still works in latent space
         return Normal(torch.tensor(0.0).to(device), torch.tensor(1.0).to(device))
 
+    # These remain unchanged
     def p_s_t(self, p_loc, p_scale, t, s):
+
+        # print(p_scale[0][0][0])
         if self.config.model.prior_type == 'logistic':
             base_dist = LogisticDistribution(loc=p_loc, scale=p_scale * np.sqrt(3. / np.pi ** 2))
         elif self.config.model.prior_type in ('gaussian', 'normal'):
@@ -884,83 +899,87 @@ class Diffusion_SD(torch.nn.Module):
 
     def relative_entropy_coding(self, q, p, compress_mode=None):
         raise NotImplementedError
-    def compute_lpips(self, x_hat, x_raw):
-        """x_hat, x_raw: [B, 3, H, W] in [0, 255]"""
-        x_hat_n = (x_hat.float().to(device) / 127.5) - 1.0  # [0,255] -> [-1,1]
-        x_raw_n = (x_raw.float().to(device) / 127.5) - 1.0
-        with torch.no_grad():
-            return self.lpips_fn(x_hat_n, x_raw_n).squeeze(-1).squeeze(-1).squeeze(-1).cpu()  # [B]
-    def extract_and_save_features(
-        self,
-        x_hat: torch.Tensor,   # [B, 3, H, W] in [0, 255]
-        x_raw: torch.Tensor,   # [B, 3, H, W] in [0, 255]
-        timestep: int,
-        save_dir: str,
-    ):
-        """Drop-in call inside the forward() diffusion loop."""
-        for split, imgs in [("real", x_raw), ("fake", x_hat)]:
-            key = (split, timestep)
-            shard_id = self._fid_shard_counters.get(key, 0)
-
-            feats = self.feat_extractor.extract(imgs)  # [B, 2048]
-            save_features(feats, save_dir, split=split, timestep=timestep, shard_id=shard_id)
-
-            self._fid_shard_counters[key] = shard_id + 1
-    def get_s_t_params(self, z_t, t, s, x_latent=None, clip_denoised=True, cache_denoised=False, deterministic=False):
+    def get_s_t_params(self, z_t, t, s, x=None, clip_denoised=True, cache_denoised=False, deterministic=False):
         """
-        Works in LATENT SPACE.
-        z_t: [B, 4, H/8, W/8] noisy latent
-        x_latent: [B, 4, H/8, W/8] clean latent (if provided)
+        Compute the (location, scale) parameters of either q(z_s | z_t, x)
+        or the reverse process distribution p(z_s | z_t) = q(z_s | z_t, x=x_hat) for the given z_t and times t, s.
+
+        Inputs:
+        -------
+        x              - if not None compute the parameters of q(z_t | z, x) instead p(z_s | z_t)
+        clip_denoised  - if True, will clip the denoised prediction x_hat(z_t) to [-1, 1];
+                         this might be used to draw better samples.
+        cache_denoised - keep the denoised prediction in memory for later use
+        deterministic  - if True, compute the mean needed for flow-based sampling instead, removing less noise overall
         """
         gamma_t, gamma_s = self.gamma(t), self.gamma(s)
         alpha_t, alpha_s = self.alpha(t), self.alpha(s)
         sigma_t, sigma_s = self.sigma(t), self.sigma(s)
-        expm1_term = (-torch.special.expm1(gamma_s - gamma_t))
+        # expm1 = 1 - alpha_t^2 / alpha_s^2 * sigma_s^2 / sigma_t^2 = sigma_t|s^2 / sigma_t^2
+        expm1_term = - torch.special.expm1(gamma_s - gamma_t)
 
-        if x_latent is None:
-            # Predict noise using score network
-            eps_hat, pred_scale_factors = self.score_net(z_t, gamma_t)
 
-            # Compute denoised prediction in LATENT space
+        if x is None:
+            if self.config.model.get('learned_prior_scale'):
+
+                eps_hat, pred_scale_factors = self.score_net(z_t, gamma_t)
+            else:
+                eps_hat,_ = self.score_net(z_t, gamma_t)
+            # Compute denoised prediction only if necessary
             if clip_denoised or cache_denoised:
-                x_latent = (z_t - sigma_t * eps_hat) / alpha_t  # Still in latent space
-
-            if clip_denoised:
-                # Clip in latent space (less aggressive than [-1,1])
-                x_latent.clamp_(-4.0, 4.0)  # Latents can have larger range
+                x = (z_t - sigma_t * eps_hat) / alpha_t  # c.f. VDM eq (30)
 
             if cache_denoised:
-                self.denoised = x_latent
+                self.denoised = x
 
+            # Variance of q(z_s | z_t, x)
             scale = sigma_s * torch.sqrt(expm1_term)
-
+            # Additional modifications for p(z_s | z_t)
             if self.config.model.get('base_prior_scale', 'forward_kernel') == 'forward_kernel':
+                # use sigma_t|s^2, the variance of q(z_t | z_s) instead
                 scale = sigma_t * torch.sqrt(expm1_term)
             if self.config.model.get('learned_prior_scale'):
                 scale = scale * pred_scale_factors
         else:
             scale = sigma_s * torch.sqrt(expm1_term)
 
-        # Mean computation - same formulas, different space
-        if x_latent is not None:
+        # Mean of q(z_s | z_t, x)
+        if x is not None:
             if deterministic:
-                loc = sigma_s / sigma_t * z_t - (alpha_t * sigma_s / sigma_t - alpha_s) * x_latent
+
+                loc = sigma_s / sigma_t * z_t - (alpha_t * sigma_s / sigma_t - alpha_s) * x
             else:
-                loc = alpha_s * ((1 - expm1_term) / alpha_t * z_t + expm1_term * x_latent)
+                loc = alpha_s * ((1 - expm1_term) / alpha_t * z_t + expm1_term * x)
         else:
             if deterministic:
+
                 loc = alpha_s / alpha_t * z_t + (sigma_s - alpha_s / alpha_t * sigma_t) * eps_hat
             else:
                 loc = alpha_s / alpha_t * (z_t - sigma_t * expm1_term * eps_hat)
 
         return loc, scale
-
-    def transmit_q_s_t(self, x_latent, z_t, t, s, compress_mode=None, cache_denoised=False, x_raw=None):
-        """x_latent is in latent space"""
+    def _get_t_emb(self, t, dev=None) -> torch.Tensor:
+        """Shared sinusoidal embedding used by both schedule and delta heads."""
+        if dev is None:
+            dev = next(self.schedule_head.parameters()).device
+        t_flat = torch.as_tensor(t, dtype=torch.float32, device=dev).view(-1)
+        dim  = self.config.get('t_emb_dim', 256)
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(10000)
+            * torch.arange(half, dtype=torch.float32, device=dev) / half
+        )
+        args = t_flat[:, None] * freqs[None, :]
+        return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # [B, dim]
+ 
+    def transmit_q_s_t(self, x_latent, z_t, t, s, compress_mode=None, cache_denoised=False,x_raw=None):
+        """Now x_latent is in latent space"""
         p_loc, p_scale = self.get_s_t_params(z_t, t, s, cache_denoised=cache_denoised)
-        q_loc, q_scale = self.get_s_t_params(z_t, t, s, x_latent=x_latent)
+        q_loc, q_scale = self.get_s_t_params(z_t, t, s, x=x_latent)
+
         p_s_t = self.p_s_t(p_loc, p_scale, t, s)
         q_s_t = self.q_s_t(q_loc, q_scale)
+                        # In transmit_q_s_t i=0:
 
         z_s, rate = self.relative_entropy_coding(q_s_t, p_s_t, compress_mode=compress_mode)
 
@@ -972,66 +991,66 @@ class Diffusion_SD(torch.nn.Module):
         x_raw: original pixel image [B, 3, H, W] for comparison
         """
         if compress_mode in ['encode', 'decode']:
+
             p = torch.distributions.Categorical(logits=self.log_probs_x_z0(z_0_latent=z_0_latent))
+
         if compress_mode == 'decode':
+
             x_raw = self.entropy_decode(self.compress_bits.pop(0), p)
         elif compress_mode == 'encode':
+
             self.compress_bits += [self.entropy_encode(x_raw, p)]
+
         return x_raw
+
+
+    
 
     @torch.no_grad()
     def sample(self, init_z=None, shape=None, times=None, deterministic=False,
-            clip_samples=False, decode_method='argmax', return_hist=False):
+               clip_samples=False, decode_method='argmax', return_hist=False):
+        """
+        Perform ancestral / flow-based sampling.
 
-        from diffusers import DDIMScheduler
-        scheduler = DDIMScheduler.from_pretrained(
-            "stable-diffusion-v1-5/stable-diffusion-v1-5",
-            subfolder="scheduler"
-        )
-
-        z = init_z if init_z is not None else torch.randn(shape, device=device)
+        Inputs:
+        -------
+        init_z        - latent state [B, C, H, W]
+        shape         - if no init_z is given specify the shape of z instead
+        times         - (optional) provide a custom (e.g. partial) sequence of steps
+        deterministic - use flow-based sampling instead of ancestral sampling
+        clip_samples  - clip latents to [-1, 1]
+        decode_method - 'argmax' or 'sample'
+        return_hist   - if set return full history of latent states
+        """
+        if init_z is None:
+            assert shape is not None
+            p_1 = self.p_1()
+            z = p_1.sample(shape)
+        else:
+            z = init_z
         if return_hist:
             samples = [z]
+        if times is None:
+            times = torch.linspace(1.0, 0.0, self.config.model.n_timesteps + 1, device=device)
 
-        null_cond = torch.zeros(z.shape[0], 77, 768, device=device)
+        # for i in trange(len(times) - 1, desc="sampling"):
+        for i in range(len(times) - 1):
 
-        if times is not None:
-            if hasattr(times, '__len__'):
-                # times is a sequence/slice e.g. sd_timesteps[i:]
-                start_ts = int(times[0].item())
-                end_ts   = int(times[-1].item())
+            t, s = times[i], times[i + 1]
+            p_loc, p_scale = self.get_s_t_params(z, t, s, clip_denoised=clip_samples, deterministic=deterministic)
+            if deterministic:
+                z = p_loc
             else:
-                # times is a scalar integer
-                start_ts = int(times)
-                end_ts   = 0
-        else:
-            start_ts = 999
-            end_ts   = 0
-
-        n_steps = min(100, start_ts - end_ts)
-
-        scheduler.set_timesteps(n_steps)
-
-        # Filter to the remaining window [end_ts, start_ts]
-        valid_timesteps = [
-            t for t in scheduler.timesteps
-            if end_ts <= t.item() <= start_ts
-        ]
-
-        for t in valid_timesteps:
-            noise_pred = self.score_net.unet(z, t, encoder_hidden_states=null_cond).sample
-            z = scheduler.step(noise_pred, t, z).prev_sample
+                z = self.p_s_t(p_loc, p_scale, t, s).sample()
             if return_hist:
                 samples.append(z)
-
         x_raw = self.decode_p_x_z_0(z_0_latent=z, method=decode_method)
 
         if return_hist:
             return x_raw, samples + [x_raw]
-        return x_raw
-
+        else:
+            return x_raw
     def forward(self, x_raw, z_1=None, recon_method=None, compress_mode=None, seed=None, timestep_path=None):
-
         x_pixel = 2 * ((x_raw.float() + .5) / self.config.model.vocab_size) - 1
         with torch.no_grad():
             x_latent = self.vae.encode(x_pixel).latent_dist.sample() * self.vae_scale_factor
@@ -1058,7 +1077,7 @@ class Diffusion_SD(torch.nn.Module):
                     z_1 = self.p_1().sample(x_latent.shape)
             loss_prior = torch.zeros(x_latent.shape[0], device=device)
 
-        # ── 2. DIFFUSION LOSS ────────────────────────────────────────────────────
+        # ── 2. DIFFUSION LOOP ────────────────────────────────────────────────────
         z_s       = z_1
         rate_s    = loss_prior
         loss_diff = 0.
@@ -1079,36 +1098,37 @@ class Diffusion_SD(torch.nn.Module):
                 )
             loss_diff += rate_s
 
-            if recon_method is not None and not torch.is_inference_mode_enabled() is False:
-                x_hat_t = self.denoise_z_t(z_t, recon_method, times=sd_timesteps[i:])
+            # collect progressive reconstructions during decompress
+            if recon_method is not None and torch.is_inference_mode_enabled():
+                # Truncate schedule to steps at or below ts_start, then prepend ts_start
+                truncated = [t for t in DDIM_SCHEDULE if t <= ts_s]
+                denoise_steps = torch.tensor(
+                    [ts_s] + truncated if (not truncated or truncated[0] != ts_s) else truncated,
+                    dtype=torch.long, device=z_s.device
+                )
+
+
+                x_hat_t = self.denoise_z_t(z_s, recon_method, times=denoise_steps)
+
                 metrics += [{
-                    'prog_bpds':   rate_t.cpu() * rescale_pixel_to_bpd,
+                    'prog_bpds':   (loss_diff * rescale_pixel_to_bpd / np.log(2)).cpu(),
                     'prog_x_hats': x_hat_t.detach().cpu(),
                     'prog_mses':   torch.mean((x_hat_t - x_raw).float()**2, dim=[1,2,3]).cpu(),
-                    'prog_lpips': self.compute_lpips(x_hat_t, x_raw),
+                    'prog_lpips':  self.compute_lpips(x_hat_t, x_raw),
                 }]
 
         z_0_latent = z_s
 
-        # ── 3. RECONSTRUCTION LOSS ───────────────────────────────────────────────
-        if recon_method is not None:
-            x_hat_final = (self.decode_p_x_z_0(z_0_latent, method='sample')
-                        if recon_method == 'ancestral'
-                        else self.decode_p_x_z_0(z_0_latent, method='argmax'))
-            metrics += [{
-                'prog_bpds':   rate_s.cpu() * rescale_pixel_to_bpd,
-                'prog_x_hats': x_hat_final.detach().cpu(),
-                'prog_mses':   torch.mean((x_hat_final - x_raw).float()**2, dim=[1,2,3]).cpu(),
-                'prog_lpips': self.compute_lpips(x_hat_final, x_raw),
-            }]
-
+        # ── 3. FINAL RECONSTRUCTION ──────────────────────────────────────────────
         log_probs  = self.log_probs_x_z0(z_0_latent=z_0_latent, x_raw=x_raw)
         loss_recon = -log_probs.sum(dim=[1, 2, 3])
-        x_raw      = self.transmit_image(z_0_latent, x_raw, compress_mode=compress_mode)
+
+        x_raw = self.transmit_image(z_0_latent, x_raw, compress_mode=compress_mode)
 
         if recon_method is not None:
+            
             metrics += [{
-                'prog_bpds':   loss_recon.cpu() * rescale_pixel_to_bpd,
+                'prog_bpds':   (loss_recon * rescale_pixel_to_bpd / np.log(2)).cpu(),
                 'prog_x_hats': x_raw.cpu(),
                 'prog_mses':   torch.zeros(x_raw.shape[0]),
                 'prog_lpips':  torch.zeros(x_raw.shape[0]),
@@ -1117,7 +1137,7 @@ class Diffusion_SD(torch.nn.Module):
         else:
             metrics = {}
 
-        # ── 4. Aggregate ─────────────────────────────────────────────────────────
+        # ── 4. AGGREGATE ─────────────────────────────────────────────────────────
         bpd_latent = loss_prior.mean() * rescale_pixel_to_bpd
         bpd_diff   = loss_diff.mean()  * rescale_pixel_to_bpd
         bpd_recon  = loss_recon.mean() * rescale_pixel_to_bpd
@@ -1136,59 +1156,93 @@ class Diffusion_SD(torch.nn.Module):
         Encode integer array k to bits using a prior / coding distribution p.
         We might want to quantize scale for determinism and added stability across multiple machines.
         """
+        # When using a scalar prior it would be better to quantize u as in tfc.UniversalBatchedEntropyModel
+        # assert self.config.model.learned_prior_scale
+
         em = EntropyModel(p)
+
         bitstring = em.compress(k)
+
         return bitstring
 
     def entropy_decode(self, bits, p):
         """
         Decode integer array from bits using the prior p.
         """
+        # assert self.config.model.learned_prior_scale
         em = EntropyModel(p)
         k = em.decompress(bits)
         return k
 
+
     @torch.inference_mode()
     def compress(self, image, timestep_path=None):
-
-        # return the bits for each step
         self.compress_bits = []
 
-        # accumulate bits
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        start_time = time.time()
+
         self.forward(image.to(device), compress_mode='encode', seed=0, timestep_path=timestep_path)
-        return self.compress_bits
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        compress_time = time.time() - start_time
+
+        return self.compress_bits, compress_time
 
     @torch.inference_mode()
     def decompress(self, bits, image_shape, recon_method='denoise', timestep_path=None):
         # consume the bits for each step, return the intermediate reconstructions for each step
         self.compress_bits = bits.copy()
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        start_time = time.time()
+
         _, metrics = self.forward(torch.zeros(image_shape, device=device), compress_mode='decode',
                                 recon_method=recon_method, seed=0, timestep_path=timestep_path)
-        return metrics['prog_x_hats']
 
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        decompress_time = time.time() - start_time
+
+        return metrics['prog_x_hats'],decompress_time
+
+    def extract_and_save_features(
+        self,
+        x_hat: torch.Tensor,   # [B, 3, H, W] in [0, 255]
+        x_raw: torch.Tensor,   # [B, 3, H, W] in [0, 255]
+        timestep: int,
+        save_dir: str,
+    ):
+        """Drop-in call inside the forward() diffusion loop."""
+        for split, imgs in [("real", x_raw), ("fake", x_hat)]:
+            key = (split, timestep)
+            shard_id = self._fid_shard_counters.get(key, 0)
+
+            feats = self.feat_extractor.extract(imgs)  # [B, 2048]
+            save_features(feats, save_dir, split=split, timestep=timestep, shard_id=shard_id)
+
+            self._fid_shard_counters[key] = shard_id + 1
     def log_probs_x_z0(self, z_0_latent, x_raw=None):
         """
-        Decode z_0_latent and compute pixel probabilities
-        z_0_latent: [B, 4, H/8, W/8]
+        Decode z_0_latent and compute pixel probabilities using a simple
+        discretized Gaussian in pixel space.
         """
-        # Decode latent to pixel space
         torch.cuda.empty_cache()
-
         with torch.no_grad():
             z_0_pixel = self.vae.decode(z_0_latent / self.vae_scale_factor).sample
+            # z_0_pixel is in [-1, 1], convert to [0, vocab_size-1]
+            z_0_pixel = ((z_0_pixel + 1) / 2 * self.config.model.vocab_size).clamp(0, self.config.model.vocab_size - 1)
 
-        gamma_0 = self.gamma(torch.tensor([0], device=device))
+        x_vals = torch.arange(self.config.model.vocab_size, device=z_0_pixel.device).float()
+        x_vals = x_vals.reshape([1] * z_0_pixel.ndim + [-1])
 
-        z_0_rescaled = z_0_pixel / torch.sqrt(torch.sigmoid(-gamma_0))
-
-        x_vals = torch.arange(self.config.model.vocab_size, device=z_0_rescaled.device)
-
-        x_vals = 2 * ((x_vals + .5) / self.config.model.vocab_size) - 1
-        x_vals = torch.reshape(x_vals, [1] * z_0_rescaled.ndim + [-1])
-
-        z = z_0_rescaled.unsqueeze(-1)
-
-        logits = -0.5 * torch.exp(-gamma_0) * (z - x_vals) ** 2
+        # simple discretized Gaussian centered at VAE output
+        sigma = 1.0  # pixel-space noise std; tune this
+        z = z_0_pixel.unsqueeze(-1)
+        logits = -0.5 * ((z - x_vals) / sigma) ** 2
 
         logprobs = torch.log_softmax(logits, dim=-1)
 
@@ -1201,14 +1255,11 @@ class Diffusion_SD(torch.nn.Module):
             return log_probs
 
     def decode_p_x_z_0(self, z_0_latent, method='argmax'):
-        """Decode latent to pixels"""
-        logprobs = self.log_probs_x_z0(z_0_latent=z_0_latent)
-        if method == 'argmax':
-            x_raw = torch.argmax(logprobs, dim=-1)
-        elif method == 'sample':
-            x_raw = torch.distributions.Categorical(logits=logprobs).sample()
-        else:
-            raise ValueError(f"Unknown decoding method {method}")
+        """Decode latent to pixels via VAE decoder."""
+        with torch.no_grad():
+            z_0_pixel = self.vae.decode(z_0_latent / self.vae_scale_factor).sample
+        # z_0_pixel is in [-1, 1]; convert to [0, vocab_size-1] uint8-range integers
+        x_raw = ((z_0_pixel + 1) / 2 * self.config.model.vocab_size).clamp(0, self.config.model.vocab_size - 1).round().long()
         return x_raw
 
     def denoise_z_t(self, z_t, recon_method, times=None):
@@ -1216,9 +1267,10 @@ class Diffusion_SD(torch.nn.Module):
         if recon_method == 'ancestral':
             x_hat_t = self.sample(
                 times=times, init_z=z_t,
-                clip_samples=True, decode_method='argmax', return_hist=False
+                clip_samples=False, decode_method='argmax', return_hist=False
             )
         elif recon_method == 'flow_based':
+
             x_hat_t = self.sample(
                 times=times, init_z=z_t, deterministic=True,
                 clip_samples=False, decode_method='argmax', return_hist=False
@@ -1274,70 +1326,48 @@ class Diffusion_SD(torch.nn.Module):
                 return self.b + w * t
 
     def save(self):
-        # Only the trainable subset of unet needs saving: LoRA adapter matrices
-        # injected into attention layers, plus the widened conv_out (eps/scale
-        # split head). The frozen SD1.5 base weights are reloaded from the
-        # pretrained checkpoint every time, so there's no need to store them.
-        trainable_state = {
-            name: param.detach().cpu()
-            for name, param in self.score_net.unet.named_parameters()
-            if param.requires_grad
-        }
-
         checkpoint = {
             'step': self.step,
             'optimizer': self.optimizer.state_dict(),
             'ema': self.ema.state_dict(),
-            'unet_trainable': trainable_state,  # LoRA weights + conv_out
+            'scale_head': self.score_net.scale_head.state_dict()
         }
-
         os.makedirs(CHECKPOINT_DIR, exist_ok=True)
         path = os.path.join(CHECKPOINT_DIR, f'ckpt_{self.step:07d}.pt')
         torch.save(checkpoint, path)
         print(f'Saved checkpoint → {path}')
 
+
     def load(self, ckpt_path=None):
-        # __init__ on SD15ScoreNet already builds the frozen base UNet,
-        # injects LoRA adapters, and widens conv_out — so the architecture is
-        # always fresh and correct before any weights are loaded into it.
         self.score_net = SD15ScoreNet(self.config)
 
-        # Optimizer/EMA must be rebuilt here, since they need to reference the
-        # *new* parameter tensors just created above — reusing whatever existed
-        # before this call would leave them pointing at stale, discarded params.
-        scale_params = [p for p in self.score_net.parameters() if p.requires_grad]
+
+        trainable_params = (
+            list(self.score_net.scale_head.parameters())
+        )
         self.optimizer = torch.optim.Adam(
-            scale_params,
+            trainable_params,
             lr=self.config.optim.lr,
             weight_decay=self.config.optim.get('weight_decay', 0.0),
         )
         self.ema = ExponentialMovingAverage(
-            scale_params,
+            trainable_params,
             decay=self.config.optim.get('ema_decay', 0.9999),
         )
 
         if ckpt_path is not None:
             cp = torch.load(ckpt_path, map_location=device, weights_only=False)
 
-            missing, unexpected = self.score_net.unet.load_state_dict(
-                cp['unet_trainable'], strict=False
-            )
-            # `missing` will list every frozen base-weight name — expected, since
-            # those were never in the checkpoint and are already correctly loaded
-            # from from_pretrained. `unexpected` should be empty; if not, the
-            # checkpoint was saved from a differently-shaped model.
-            assert len(unexpected) == 0, f'Unexpected keys in checkpoint: {unexpected}'
-
+            self.score_net.scale_head.load_state_dict(cp['scale_head'])
             if 'optimizer' in cp:
                 self.optimizer.load_state_dict(cp['optimizer'])
             if 'ema' in cp:
                 self.ema.load_state_dict(cp['ema'])
             if 'step' in cp:
                 self.step = cp['step']
-            print(f'Loaded LoRA adapter + conv_out weights from {ckpt_path}')
+            print(f'Loaded checkpoint from {ckpt_path}')
         else:
-            print('No checkpoint provided — LoRA adapters and conv_out randomly initialised.')
-
+            print('No checkpoint provided — starting fresh.')
     def trainer(self, train_iter, eval_iter=None, timestep_path=None):
         """
         Train UQDM-style SD1.5 model for a specified number of steps on a train set.
@@ -2028,7 +2058,7 @@ if __name__ == "__main__":
     parser.add_argument("--fid_save_dir", default="fid_features")
     parser.add_argument("--fid_num_images", type=int, default=5000)
     args = parser.parse_args()
-    args = parser.parse_args()
+
 
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     np.random.seed(args.seed)
@@ -2044,9 +2074,9 @@ if __name__ == "__main__":
         model.trainer(train_iter, eval_iter,timesteps = timesteps)
 
     elif args.mode == 'eval':
-        os.makedirs(args.save_dir, exist_ok=True)
+        # os.makedirs(args.save_dir, exist_ok=True)
 
-        timesteps = [999, 312, 110, 0]
+        timesteps = [700, 312, 110, 0]
 
         # ── 1. RD metrics loop (Kodak / small set) ────────────────────────────────
         all_bpps, all_psnrs, all_lpips = [], [], []
@@ -2060,7 +2090,6 @@ if __name__ == "__main__":
                 compressed, image.shape, recon_method='flow_based', timestep_path=timesteps
             )
             assert (reconstructions[-1] == image).all()
-            reconstructions = reconstructions[1:]
 
             psnrs = [compute_psnr(image, recon) for recon in reconstructions]
             lpips_scores = [
@@ -2095,6 +2124,7 @@ if __name__ == "__main__":
         np.savetxt(os.path.join(args.save_dir, 'mean_psnrs.txt'), mean_psnrs, fmt='%.6f', header='psnr')
         np.savetxt(os.path.join(args.save_dir, 'mean_lpips.txt'), mean_lpips, fmt='%.6f', header='lpips')
 
+        # ── 2. FID loop — only runs if --fid_data is provided ────────────────────
         if args.fid_data is not None:
             print(f"\n{'='*60}")
             print(f"FID extraction on: {args.fid_data}  ({args.fid_num_images} images)")
@@ -2115,9 +2145,9 @@ if __name__ == "__main__":
                     recon_method='flow_based',
                     timestep_path=timesteps,
                 )
-                reconstructions = reconstructions[1:]
 
-                for recon, ts in zip(reconstructions, timesteps[1:]):
+
+                for recon, ts in zip(reconstructions, timesteps):
                     model.extract_and_save_features(
                         x_hat=recon,
                         x_raw=image,
@@ -2134,7 +2164,7 @@ if __name__ == "__main__":
             print(f"\n{'='*60}")
             print(f"{'Timestep':>10} | {'BPP':>8} | {'PSNR':>8} | {'LPIPS':>8} | {'FID':>8}")
             print(f"{'-'*10}-+-{'-'*8}-+-{'-'*8}-+-{'-'*8}-+-{'-'*8}")
-            for step_idx, ts in enumerate(timesteps[1:]):
+            for step_idx, ts in enumerate(timesteps):
                 print(
                     f"{ts:>10} | {mean_bpps[step_idx]:>8.4f} | "
                     f"{mean_psnrs[step_idx]:>8.4f} | "
